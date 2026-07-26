@@ -1631,6 +1631,13 @@ PAGE = r"""<!doctype html>
   --steel-dim:#2C4557;
   --rust:#DC6148;      /* destructive + error. Nothing else. 5.05:1 on bench  */
   --ok:#8FBF7A;
+  --amber-lit:#FFB000; /* fixed: only inside the always-dark readout           */
+  --steel-ink:#CFE6F5; /* text on a steel-tinted fill                          */
+  --on-steel:#0B1219;  /* text on a solid steel fill                           */
+  --on-amber:#100E0C;  /* text on a solid amber fill                           */
+  --ok-edge:#31402C; --err-edge:#4A2A24; --err-bg:#2A1A16; --err-ink:#E9A192;
+  --warn-bg:#241B0E; --warn-edge:#4A3A16; --warn-ink:#F0C77E;
+  --veil:#141110F2;
 
   --ui:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
   --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Mono",Menlo,Consolas,monospace;
@@ -1665,7 +1672,7 @@ body{
 }
 .brand{display:flex;align-items:baseline;gap:11px;margin-right:auto}
 .brand .mark{
-  font:700 15px/1 var(--mono);color:var(--void);background:var(--amber);
+  font:700 15px/1 var(--mono);color:var(--on-amber);background:var(--amber);
   padding:5px 6px;border-radius:2px;letter-spacing:-.06em;align-self:center}
 .brand h1{
   margin:0;font-size:16px;font-weight:650;letter-spacing:-.015em;white-space:nowrap}
@@ -1681,7 +1688,7 @@ body{
 .pill::before{
   content:"";width:5px;height:5px;border-radius:50%;background:currentColor;
   opacity:.55}
-.pill.on{color:var(--ok);border-color:#31402C}
+.pill.on{color:var(--ok);border-color:var(--ok-edge)}
 .pill.off{color:var(--faint)}
 
 /* ---------- shell ------------------------------------------------------- */
@@ -1736,7 +1743,7 @@ body{
   font:600 9.5px/1 var(--mono);letter-spacing:.19em;text-transform:uppercase;
   color:var(--faint);font-style:normal}
 .ro-cell b{
-  font:500 19px/1.05 var(--mono);letter-spacing:-.01em;color:var(--amber);
+  font:500 19px/1.05 var(--mono);letter-spacing:-.01em;color:var(--amber-lit);
   text-shadow:0 0 16px #FFB00040;white-space:nowrap}
 .readout[data-state="idle"] .ro-cell b{
   color:var(--faint);text-shadow:none;font-size:15px;font-weight:400}
@@ -1787,11 +1794,11 @@ body{
   border:1px solid var(--edge-hi);background:var(--riser);color:var(--paper)}
 .btn{padding:8px 14px;font-size:13.5px}
 .btn:hover{background:var(--edge);border-color:var(--edge-hi)}
-.btn.danger{color:var(--rust);border-color:#4A2A24}
-.btn.danger:hover{background:#2A1A16;border-color:var(--rust)}
+.btn.danger{color:var(--rust);border-color:var(--err-edge)}
+.btn.danger:hover{background:var(--err-bg);border-color:var(--rust)}
 button.primary{
   padding:12px 26px;font-size:14.5px;font-weight:650;letter-spacing:.01em;
-  background:var(--steel);color:#0B1219;border-color:var(--steel)}
+  background:var(--steel);color:var(--on-steel);border-color:var(--steel)}
 button.primary:hover:not(:disabled){background:#98C1DE;border-color:#98C1DE}
 button.primary:disabled{
   background:var(--riser);color:var(--faint);border-color:var(--edge);
@@ -1819,7 +1826,7 @@ input[type=color]{
   transition:.12s}
 .chip:hover{color:var(--paper);border-color:var(--edge-hi)}
 .chip.active{
-  background:var(--steel-dim);border-color:var(--steel);color:#CFE6F5}
+  background:var(--steel-dim);border-color:var(--steel);color:var(--steel-ink)}
 
 .opts{
   display:flex;gap:16px;flex-wrap:wrap;align-items:center;
@@ -1843,7 +1850,7 @@ input[type=color]{
 .pg:hover{background:var(--riser)}
 .pg img,.pg canvas{
   width:100%;display:block;border-radius:2px;border:1px solid var(--edge);
-  background:var(--paper)}
+  background:#fff}
 .pg .n{
   display:block;text-align:center;font:11px var(--mono);color:var(--faint);
   margin-top:4px}
@@ -1951,7 +1958,7 @@ input[type=color]{
 .actions{
   position:fixed;left:var(--rail-w);right:0;bottom:0;z-index:30;
   display:flex;align-items:center;gap:16px;
-  padding:13px 22px;background:#141110F2;backdrop-filter:blur(9px);
+  padding:13px 22px;background:var(--veil);backdrop-filter:blur(9px);
   border-top:1px solid var(--edge)}
 .status{
   flex:1;min-width:0;font:12px/1.5 var(--mono);color:var(--dim);
@@ -1974,8 +1981,8 @@ input[type=color]{
 .warn,.warn2{
   padding:11px 14px;margin-bottom:12px;border-radius:var(--r);
   font-size:13.5px;line-height:1.55;
-  background:#241B0E;border:1px solid #4A3A16;color:#F0C77E}
-.warn2{background:#2A1A16;border-color:#4A2A24;color:#E9A192}
+  background:var(--warn-bg);border:1px solid var(--warn-edge);color:var(--warn-ink)}
+.warn2{background:var(--err-bg);border-color:var(--err-edge);color:var(--err-ink)}
 .warn:empty,.warn2:empty{display:none}
 
 /* ---------- toasts --------------------------------------------------------- */
@@ -1986,8 +1993,8 @@ input[type=color]{
   background:var(--riser);border:1px solid var(--edge-hi);color:var(--paper);
   box-shadow:0 8px 24px #00000066;
   animation:rise .18s ease}
-.toast.ok{border-color:#3B4C34;color:var(--ok)}
-.toast.err{border-color:#4A2A24;color:var(--rust)}
+.toast.ok{border-color:var(--ok-edge);color:var(--ok)}
+.toast.err{border-color:var(--err-edge);color:var(--rust)}
 @keyframes rise{from{opacity:0;transform:translateY(7px)}}
 
 /* ---------- responsive ------------------------------------------------------ */
@@ -2016,6 +2023,35 @@ input[type=color]{
   .ytcard{flex-direction:column}
   .ytcard img{width:100%}
 }
+/* ---------- light chassis --------------------------------------------------
+   The same instrument under bench lighting rather than darkroom lighting.
+   The readout stays dark in both, because a real display does.
+   -------------------------------------------------------------------------- */
+:root[data-theme="light"]{
+  --void:#E9E4DA; --bench:#F5F1EA; --riser:#FFFFFF;
+  --edge:#D3CABB; --edge-hi:#B2A593;
+  --paper:#1D1915; --dim:#544C43; --faint:#6E6357;
+  --amber:#7D5100; --steel:#255C82; --steel-dim:#D2E2EE;
+  --rust:#A2361F; --ok:#376E27;
+  --steel-ink:#10394F; --on-steel:#FFFFFF; --on-amber:#FFFFFF;
+  --ok-edge:#A9C39C; --err-edge:#D8AEA3; --err-bg:#F7E7E2; --err-ink:#8A2E19;
+  --warn-bg:#FBF0D8; --warn-edge:#DCC38A; --warn-ink:#6B4B08;
+  --veil:#F5F1EAF2;
+}
+:root[data-theme="light"] .rail{
+  background:linear-gradient(180deg,var(--bench),var(--void) 220px)}
+:root[data-theme="light"] .toast{box-shadow:0 8px 24px #00000024}
+
+/* the theme control — a contrast mark, not a sun or a moon */
+.theme{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:28px;height:28px;padding:0;flex:none;cursor:pointer;
+  border-radius:var(--r);border:1px solid var(--edge);
+  background:var(--void);color:var(--dim);transition:.13s}
+.theme:hover{color:var(--paper);border-color:var(--steel);background:var(--riser)}
+.theme svg{width:15px;height:15px;display:block;transition:transform .22s ease}
+:root[data-theme="light"] .theme svg{transform:rotate(180deg)}
+
 @media (prefers-reduced-motion:reduce){
   *{animation-duration:.001ms!important;transition-duration:.001ms!important}
 }
@@ -2025,6 +2061,14 @@ input[type=color]{
   <div class="brand">
     <span class="mark" aria-hidden="true">▚</span>
     <h1>Multi Toolkit</h1>
+    <button class="theme" id="themeBtn" type="button"
+            aria-label="Switch to light theme">
+      <svg viewBox="0 0 16 16" aria-hidden="true">
+        <circle cx="8" cy="8" r="6.3" fill="none" stroke="currentColor"
+                stroke-width="1.5"/>
+        <path d="M8 1.7a6.3 6.3 0 0 1 0 12.6z" fill="currentColor"/>
+      </svg>
+    </button>
     <span class="eyebrow">local workbench</span>
   </div>
   <div class="pills">
@@ -2281,8 +2325,12 @@ input[type=color]{
         </div>
 
         <div class="card">
-          <h4>Centre logo</h4>
-          <div class="logodrop" id="qrLogoDrop">
+          <h4>Centre mark</h4>
+          <div class="chips" id="qrLogoMode">
+            <span class="chip active" data-m="plain">Plain code</span>
+            <span class="chip" data-m="logo">With a logo</span>
+          </div>
+          <div class="logodrop hide" id="qrLogoDrop">
             <b>Drop a logo</b> or click to choose — PNG with a transparent
             background works best
             <input type="file" id="qrLogoFile" accept="image/*" hidden>
@@ -3117,6 +3165,20 @@ $('qrPad').addEventListener('change',()=>{
 $('qrTransparent').addEventListener('change',()=>{
   $('qrBg').disabled=$('qrTransparent').checked;});
 
+/* plain vs logo — an explicit choice, so a plain code needs no upload */
+function qrSetLogoMode(mode){
+  const wantLogo = mode==='logo';
+  document.querySelectorAll('#qrLogoMode .chip').forEach(c=>
+    c.classList.toggle('active', c.dataset.m===mode));
+  $('qrLogoDrop').classList.toggle('hide', !wantLogo || !!qrLogo);
+  $('qrLogoChip').classList.toggle('hide', !wantLogo || !qrLogo);
+  $('qrLogoOpts').classList.toggle('hide', !wantLogo || !qrLogo);
+  if(!wantLogo && qrLogo){ qrLogo=null; $('qrLogoThumb').removeAttribute('src'); }
+  qrRefresh();
+}
+document.querySelectorAll('#qrLogoMode .chip').forEach(c=>
+  c.onclick=()=>qrSetLogoMode(c.dataset.m));
+
 /* logo picking */
 function qrSetLogo(file){
   if(!file) return;
@@ -3125,12 +3187,9 @@ function qrSetLogo(file){
   r.onload=()=>{
     qrLogo={name:file.name,data:String(r.result).split(',')[1],url:String(r.result)};
     $('qrLogoThumb').src=qrLogo.url; $('qrLogoName').textContent=file.name;
-    $('qrLogoChip').classList.remove('hide');
-    $('qrLogoOpts').classList.remove('hide');
-    $('qrLogoDrop').classList.add('hide');
     if($('qrEc').value!=='H'){ $('qrEc').value='H';
       toast('Error correction raised to H for the logo'); }
-    qrRefresh();
+    qrSetLogoMode('logo');
   };
   r.readAsDataURL(file);
 }
@@ -3142,9 +3201,8 @@ $('qrLogoFile').onchange=e=>{qrSetLogo(e.target.files[0]);e.target.value='';};
   e.preventDefault();e.stopPropagation();$('qrLogoDrop').classList.remove('hot');}));
 $('qrLogoDrop').addEventListener('drop',e=>qrSetLogo(e.dataTransfer.files[0]));
 $('qrLogoClear').onclick=()=>{
-  qrLogo=null; $('qrLogoChip').classList.add('hide');
-  $('qrLogoOpts').classList.add('hide'); $('qrLogoDrop').classList.remove('hide');
-  qrRefresh();
+  qrLogo=null; $('qrLogoThumb').removeAttribute('src');
+  qrSetLogoMode('logo');   // stay in logo mode, ready for another file
 };
 
 async function qrRefresh(){
@@ -3367,6 +3425,21 @@ $('imgFile').onchange=e=>{imgTakeFile(e.target.files[0]);e.target.value='';};
   e.preventDefault();e.stopPropagation();$('imgDrop').classList.remove('hot');}));
 $('imgDrop').addEventListener('drop',e=>imgTakeFile(e.dataTransfer.files[0]));
 
+
+/* ---------- theme ---------- */
+function applyTheme(t){
+  document.documentElement.setAttribute('data-theme',t);
+  document.documentElement.style.colorScheme=t;
+  $('themeBtn').setAttribute('aria-label',
+    'Switch to '+(t==='dark'?'light':'dark')+' theme');
+}
+applyTheme(document.documentElement.getAttribute('data-theme')||'dark');
+$('themeBtn').onclick=()=>{
+  const next=document.documentElement.getAttribute('data-theme')==='dark'
+    ? 'light' : 'dark';
+  applyTheme(next);
+  try{ localStorage.setItem('mtk-theme',next); }catch(e){}
+};
 
 /* ---------- the readout ---------- */
 function setReadout(state, cells){
