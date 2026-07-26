@@ -9,7 +9,13 @@ HTML in a simulated DOM and drive the controls.
 | `test_server.py` | Every HTTP route end-to-end against a live server, including error paths, cache-miss 409s, and regression cover for the PDF routes. |
 | `test_ui.js` | Boots the app's page in jsdom, clicks every tab and control, checks panel visibility and the crop/aspect maths. |
 | `test_docs.js` | Boots `docs/index.html` with a real canvas, renders the QR demo and writes PNGs to `/tmp/qrdemo` for independent decoding. |
-| `audit_design.py` | Static design audit of the app stylesheet: every class in the markup has a rule, no accidental duplicate selectors, real WCAG contrast ratios for each text-on-surface pair, and the two-accent rule (amber only for machine-reported data, steel only for interactive state). Pure Python, no extra packages. |
+| `test_pages_layout.js` | Serves the page over real HTTP in **both** GitHub Pages layouts (publishing `/docs`, and publishing the repo root) and checks the QR library resolves either way. Written after a live failure where Pages published the root and `vendor/qrcode.js` 404'd. |
+| `audit_design.py` | Static design audit of **both** the app UI and `docs/index.html`, in **both** themes: every class has a rule, no accidental duplicate selectors, real WCAG contrast for each text-on-surface pair, the two-accent rule (amber = measured fact, steel = interactive), and markup integrity. Pure Python, no extra packages. |
+
+The markup check exists because of a real bug: an SVG data-URI favicon contained
+raw `>` characters, a regex edit truncated the tag, and the leftover fragment
+broke `<head>` — leaving a stray `">` visible at the top of the page. The audit
+now fails on any attribute value containing a raw `>`.
 
 ## Running them
 
@@ -31,6 +37,7 @@ Node suites:
 npm install jsdom canvas
 node tests/test_ui.js
 node tests/test_docs.js
+node tests/test_pages_layout.js
 ```
 
 To confirm the docs demo produces scannable codes, decode what `test_docs.js`
@@ -56,3 +63,17 @@ OpenCV's `QRCodeDetector` fails on high-version codes (roughly v20+) that zbar
 and real phone cameras read without trouble. `test_qr.py` therefore treats zbar
 as the source of truth and reports OpenCV as a stricter second opinion, not a
 gate. A code that zbar reads but OpenCV misses is not a broken code.
+
+
+## Two bugs these suites exist to prevent
+
+**A raw `>` inside an attribute value.** An SVG data-URI favicon contained `>`
+characters; a regex edit truncated the tag and the leftover fragment broke
+`<head>`, leaving a stray `">` visible at the top of the page. `audit_design.py`
+now fails on any attribute value containing a raw `>`.
+
+**A bare `[hidden]` attribute.** Author styles outrank the user-agent sheet, so
+`.row{display:flex}` silently overrode the browser's `[hidden]{display:none}`
+and the logo controls stayed visible. jsdom's cascade does not reproduce this,
+so the audit checks statically that a `[hidden]{display:none!important}` reset
+exists wherever the markup uses the attribute.

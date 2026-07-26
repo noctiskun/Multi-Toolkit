@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Multi Toolkit — PDFs, media &amp; QR codes, all on your own machine</title>
-<meta name="description" content="A single-file local workbench: merge/split/compress/convert PDFs, download video, reframe to 9:16, crop images, and build QR codes with a centre logo. Nothing is uploaded anywhere.">
+<title>Multi Toolkit — PDFs, video and QR codes, on your own machine</title>
+<meta name="description" content="One Python file that turns your browser into a local workbench: merge and split PDFs, download and reframe video, crop images, and build QR codes with a centre logo. Nothing is uploaded.">
 <meta property="og:title" content="Multi Toolkit">
-<meta property="og:description" content="PDFs, media and QR codes — running entirely on your own machine.">
+<meta property="og:description" content="PDFs, video and QR codes — on your machine, not ours.">
 <meta property="og:type" content="website">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%23100E0C'/><rect x='6' y='6' width='9' height='9' fill='%23FFB000'/><rect x='17' y='6' width='9' height='9' fill='%23EFE9E1'/><rect x='6' y='17' width='9' height='9' fill='%23EFE9E1'/><rect x='19' y='19' width='5' height='5' fill='%23FFB000'/></svg>"><rect width='32' height='32' rx='7' fill='%238b7bff'/><rect x='7' y='7' width='7' height='7' fill='%23fff'/><rect x='18' y='7' width='7' height='7' fill='%23fff'/><rect x='7' y='18' width='7' height='7' fill='%23fff'/><rect x='19' y='19' width='4' height='4' fill='%23fff'/></svg>">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23100E0C'/%3E%3Crect x='6' y='6' width='9' height='9' fill='%23FFB000'/%3E%3Crect x='17' y='6' width='9' height='9' fill='%23EFE9E1'/%3E%3Crect x='6' y='17' width='9' height='9' fill='%23EFE9E1'/%3E%3Crect x='19' y='19' width='5' height='5' fill='%23FFB000'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -24,12 +24,17 @@
   --paper:#EFE9E1; --dim:#9C8F84; --faint:#827568;
   --amber:#FFB000; --amber-dk:#5C4410; --steel:#7FAECF; --steel-dim:#2C4557;
   --rust:#DC6148; --ok:#8FBF7A;
+  --amber-lit:#FFB000; --steel-ink:#CFE6F5;
+  --on-steel:#0B1219; --on-amber:#100E0C; --veil:#191512F2;
   --disp:"Archivo",system-ui,-apple-system,"Segoe UI",sans-serif;
   --ui:"Archivo",system-ui,-apple-system,"Segoe UI",Helvetica,sans-serif;
   --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace;
   --r:4px; --r-lg:7px; --gut:clamp(18px,4vw,40px);
 }
 *{box-sizing:border-box}
+/* Author styles beat the UA sheet, so `.row{display:flex}` would otherwise
+   override the built-in [hidden]{display:none}. Restate it with !important. */
+[hidden]{display:none!important}
 ::selection{background:var(--steel);color:var(--void)}
 html{color-scheme:dark;scroll-behavior:smooth}
 body{margin:0;background:var(--void);color:var(--paper);
@@ -43,10 +48,10 @@ a{color:var(--steel)}
 
 /* ---------- masthead ---------- */
 .masthead{position:sticky;top:0;z-index:50;display:flex;align-items:center;
-  gap:16px;padding:12px var(--gut);background:#191512F2;backdrop-filter:blur(10px);
+  gap:16px;padding:12px var(--gut);background:var(--veil);backdrop-filter:blur(10px);
   border-bottom:1px solid var(--edge)}
 .brand{display:flex;align-items:center;gap:10px;margin-right:auto}
-.brand .mark{font:600 14px/1 var(--mono);color:var(--void);background:var(--amber);
+.brand .mark{font:600 14px/1 var(--mono);color:var(--on-amber);background:var(--amber);
   padding:5px 6px;border-radius:2px;letter-spacing:-.06em}
 .brand b{font:600 15px/1 var(--disp);letter-spacing:-.01em}
 .masthead .lab{display:none}
@@ -81,7 +86,7 @@ a{color:var(--steel)}
 .ro-cell{display:flex;flex-direction:column-reverse;gap:3px;min-width:0}
 .ro-cell i{font:600 9.5px/1 var(--mono);letter-spacing:.19em;
   text-transform:uppercase;color:var(--faint);font-style:normal}
-.ro-cell b{font:500 20px/1.05 var(--mono);color:var(--amber);
+.ro-cell b{font:500 20px/1.05 var(--mono);color:var(--amber-lit);
   text-shadow:0 0 16px #FFB00040;white-space:nowrap}
 .readout[data-state="idle"] .ro-cell b{color:var(--faint);text-shadow:none;
   font-size:15px;font-weight:400}
@@ -102,7 +107,7 @@ a{color:var(--steel)}
   border-radius:var(--r);cursor:pointer;user-select:none;transition:.12s;
   border:1px solid var(--edge);background:var(--void);color:var(--dim)}
 .chip:hover{color:var(--paper);border-color:var(--edge-hi)}
-.chip.active{background:var(--steel-dim);border-color:var(--steel);color:#CFE6F5}
+.chip.active{background:var(--steel-dim);border-color:var(--steel);color:var(--steel-ink)}
 .fld{display:flex;flex-direction:column;gap:5px;margin-bottom:11px}
 .fld>span{font:600 9.5px/1 var(--mono);letter-spacing:.19em;
   text-transform:uppercase;color:var(--faint)}
@@ -148,7 +153,7 @@ input[type=range]{accent-color:var(--amber);width:104px}
 .warnline:empty{display:none}
 .grab{width:100%;margin-top:12px;padding:12px;cursor:pointer;
   border-radius:var(--r);font:600 14px var(--ui);background:var(--steel);
-  color:#0B1219;border:1px solid var(--steel);transition:.12s}
+  color:var(--on-steel);border:1px solid var(--steel);transition:.12s}
 .grab:hover:not(:disabled){background:#98C1DE}
 .grab:disabled{background:var(--riser);color:var(--faint);
   border-color:var(--edge);cursor:not-allowed}
@@ -201,11 +206,44 @@ td:last-child{font-family:var(--mono);font-size:12.5px;line-height:1.9;
 footer{padding:34px 0 56px;color:var(--faint);font-size:13px;line-height:1.7;
   border-top:1px solid var(--edge)}
 footer a{color:var(--dim)}
+/* ---------- light chassis ----------
+   The same instrument under bench lighting. The readout stays dark in both,
+   because a real display does. */
+:root[data-theme="light"]{
+  --void:#E9E4DA; --bench:#F5F1EA; --riser:#FFFFFF;
+  --edge:#D3CABB; --edge-hi:#B2A593;
+  --paper:#1D1915; --dim:#544C43; --faint:#6E6357;
+  --amber:#7D5100; --amber-dk:#C9A75C; --steel:#255C82; --steel-dim:#D2E2EE;
+  --rust:#A2361F; --ok:#376E27;
+  --steel-ink:#10394F; --on-steel:#FFFFFF; --on-amber:#FFFFFF;
+  --veil:#F5F1EAF2;
+}
+
+/* the theme control — a contrast mark, not a sun or a moon */
+.theme{display:inline-flex;align-items:center;justify-content:center;
+  width:28px;height:28px;padding:0;flex:none;cursor:pointer;
+  border-radius:var(--r);border:1px solid var(--edge);
+  background:var(--void);color:var(--dim);transition:.13s}
+.theme:hover{color:var(--paper);border-color:var(--steel);background:var(--riser)}
+.theme svg{width:15px;height:15px;display:block;transition:transform .22s ease}
+:root[data-theme="light"] .theme svg{transform:rotate(180deg)}
+
 @media (prefers-reduced-motion:reduce){
   *{animation-duration:.001ms!important;transition-duration:.001ms!important;
     scroll-behavior:auto!important}
 }
 </style>
+<script>
+/* Applied before first paint so the page never flashes the wrong chassis. */
+(function(){
+  var root=document.documentElement, saved=null;
+  try{ saved=localStorage.getItem('mtk-theme'); }catch(e){}
+  var t = saved || (window.matchMedia
+    && matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  root.setAttribute('data-theme', t);
+  root.style.colorScheme = t;
+})();
+</script>
 </head>
 <body>
 
@@ -214,6 +252,14 @@ footer a{color:var(--dim)}
     <span class="mark" aria-hidden="true">&#9626;</span>
     <b>Multi Toolkit</b>
   </div>
+  <button class="theme" id="themeBtn" type="button"
+          aria-label="Switch to light theme">
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <circle cx="8" cy="8" r="6.3" fill="none" stroke="currentColor"
+              stroke-width="1.5"/>
+      <path d="M8 1.7a6.3 6.3 0 0 1 0 12.6z" fill="currentColor"/>
+    </svg>
+  </button>
   <span class="lab">local workbench</span>
   <a class="ghost" id="repoLink" href="#install">GitHub</a>
 </header>
@@ -245,8 +291,12 @@ footer a{color:var(--dim)}
         <div id="fields"></div>
 
         <div class="set">
-          <span class="lab">Centre logo</span>
-          <div class="logodrop" id="logoDrop">
+          <span class="lab">Centre mark</span>
+          <div class="chips" id="logoMode">
+            <span class="chip active" data-m="plain">Plain code</span>
+            <span class="chip" data-m="logo">With a logo</span>
+          </div>
+          <div class="logodrop" id="logoDrop" hidden>
             <b>Drop a logo</b> or click to choose &mdash; PNG with a transparent
             background works best
             <input type="file" id="logoFile" accept="image/*" hidden>
@@ -447,7 +497,7 @@ python multi_toolkit.py</code></pre>
 <script src="vendor/qrcode.js"></script>
 <script src="vendor/qrcode_UTF8.js"></script>
 <script>
-(function(){
+window.__qrDemoBoot = function(){
   "use strict";
   var $ = function(id){ return document.getElementById(id); };
 
@@ -757,6 +807,38 @@ python multi_toolkit.py</code></pre>
     $('bg').disabled = $('transparent').checked;
   });
 
+  /* ---------- theme ---------- */
+  function applyTheme(t){
+    document.documentElement.setAttribute('data-theme', t);
+    document.documentElement.style.colorScheme = t;
+    $('themeBtn').setAttribute('aria-label',
+      'Switch to ' + (t === 'dark' ? 'light' : 'dark') + ' theme');
+  }
+  applyTheme(document.documentElement.getAttribute('data-theme') || 'dark');
+  $('themeBtn').addEventListener('click', function(){
+    var next = document.documentElement.getAttribute('data-theme') === 'dark'
+      ? 'light' : 'dark';
+    applyTheme(next);
+    try { localStorage.setItem('mtk-theme', next); } catch(e){}
+  });
+
+  /* ---------- plain vs logo ----------
+     An explicit choice, so a plain code never waits on an upload. */
+  function setLogoMode(mode){
+    var wantLogo = mode === 'logo';
+    [].forEach.call(document.querySelectorAll('#logoMode .chip'), function(c){
+      c.classList.toggle('active', c.dataset.m === mode);
+    });
+    $('logoDrop').hidden  = !wantLogo || !!logoImg;
+    $('logoChip').hidden  = !wantLogo || !logoImg;
+    $('logoOpts').hidden  = !wantLogo || !logoImg;
+    if (!wantLogo && logoImg){ logoImg = null; }
+    render();
+  }
+  [].forEach.call(document.querySelectorAll('#logoMode .chip'), function(c){
+    c.addEventListener('click', function(){ setLogoMode(c.dataset.m); });
+  });
+
   function takeLogo(file){
     if (!file || !/^image\//.test(file.type)) return;
     var fr = new FileReader();
@@ -795,10 +877,8 @@ python multi_toolkit.py</code></pre>
   });
   $('logoClear').addEventListener('click', function(){
     logoImg = null;
-    $('logoChip').hidden = true;
-    $('logoOpts').hidden = true;
-    $('logoDrop').hidden = false;
-    render();
+    $('logoThumb').removeAttribute('src');
+    setLogoMode('logo');      // stay ready for another file
   });
 
   $('dl').addEventListener('click', function(){
@@ -830,7 +910,31 @@ python multi_toolkit.py</code></pre>
 
   window.__qrDemo = { render: render, buildPayload: buildPayload,
                       setKind: function(k){ kind = k; buildFields(); },
-                      setLogo: function(img){ logoImg = img; } };
+                      setLogo: function(img){ logoImg = img; },
+                      setLogoMode: setLogoMode };
+};
+
+/* ---------------------------------------------------------------------------
+   The QR library sits in docs/vendor/. Which relative path reaches it depends
+   on whether GitHub Pages is publishing the /docs folder or the repo root, so
+   try both rather than depending on one project layout.
+   --------------------------------------------------------------------------- */
+(function(){
+  function start(){
+    try { window.__qrDemoBoot(); }
+    catch (e) { if (window.console) console.error(e); }
+  }
+  if (typeof qrcode === 'function') return start();
+
+  var alt = ['docs/vendor/qrcode.js', 'docs/vendor/qrcode_UTF8.js'], i = 0;
+  (function next(){
+    if (i >= alt.length) return start();   // give up; the page shows the error
+    var el = document.createElement('script');
+    el.src = alt[i++];
+    el.onload = next;
+    el.onerror = next;
+    document.head.appendChild(el);
+  })();
 })();
 </script>
 </body>

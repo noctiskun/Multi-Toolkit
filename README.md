@@ -138,7 +138,15 @@ Only download videos you own or have permission to save.
 
 The QR generator is the one exception, because QR encoding needs no server at all. The project page therefore ships a complete client-side implementation that mirrors the Python renderer: same module styles, same finder-pattern handling, same silhouette logic, same warnings.
 
-To publish it: push the repo, then **Settings → Pages → Source: `main` branch, `/docs` folder**. That's it — no workflow file, no build step. The QR library is vendored in `docs/vendor/`, so the page has no external dependencies and works offline.
+### Publishing it
+
+**Settings → Pages → Source: `main` branch, `/docs` folder.** No workflow file, no build step. The QR library is vendored in `docs/vendor/`, so the page has no external dependencies.
+
+If Pages is instead publishing the **repo root**, the page still works — it looks for the library at `vendor/qrcode.js` first and falls back to `docs/vendor/qrcode.js`. Both layouts are covered by `tests/test_pages_layout.js`.
+
+What *will* break it is publishing the root while `docs/` is missing, or copying `index.html` to the root without its `vendor/` folder. If the page shows **"qr library did not load"**, open your browser's Network tab and look for a 404 on `qrcode.js` — the path it asked for tells you which layout Pages thinks it has.
+
+Keep one copy of `index.html` (in `docs/`) rather than one at the root as well. Two copies drift apart, and only one of them is the page anyone sees.
 
 ---
 

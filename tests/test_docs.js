@@ -139,6 +139,7 @@ setTimeout(() => {
 
   // logo, silhouette, no plate — the look from the reference image
   const logo = makeLogo();
+  win.__qrDemo.setLogoMode('logo');
   win.__qrDemo.setLogo(logo);
   $('logoStyle').value = 'silhouette'; fire($('logoStyle'), 'change');
   $('logoPct').value = 24; fire($('logoPct'), 'input');
@@ -152,7 +153,7 @@ setTimeout(() => {
   $('logoStyle').value = 'original'; fire($('logoStyle'), 'change');
   cases.push(['logo-original', 'https://siu.example', dump('logo_original')]);
 
-  win.__qrDemo.setLogo(null);
+  win.__qrDemo.setLogoMode('plain');
   $('plate').checked = false; fire($('plate'), 'change');
 
   // wifi + vcard payloads
@@ -183,6 +184,38 @@ setTimeout(() => {
   for (const [name, , info] of cases) {
     console.log(`  rendered ${name.padEnd(18)} ${info.w}x${info.h} ${Math.round(info.bytes / 1024)}KB`);
   }
+
+  console.log('\n== theme + optional logo ==');
+  step('theme toggle flips the chassis, no emoji', () => {
+    const before = doc.documentElement.getAttribute('data-theme');
+    $('themeBtn').dispatchEvent(new win.Event('click', { bubbles: true }));
+    if (doc.documentElement.getAttribute('data-theme') === before)
+      throw new Error('did not change');
+    if (!$('themeBtn').querySelector('svg')) throw new Error('no svg glyph');
+    if (/[\u2600-\u27BF\u{1F300}-\u{1F9FF}]/u.test($('themeBtn').textContent))
+      throw new Error('emoji found');
+    $('themeBtn').dispatchEvent(new win.Event('click', { bubbles: true }));
+  });
+  step('plain is the default and needs no upload', () => {
+    const chosen = doc.querySelector('#logoMode .chip.active');
+    if (!chosen || chosen.dataset.m !== 'plain') throw new Error('not plain');
+    if (!$('logoDrop').hidden) throw new Error('upload zone showing');
+    if ($('readout').dataset.state !== 'live')
+      throw new Error('plain code did not render');
+  });
+  step('switching to logo reveals the upload, and back hides it', () => {
+    doc.querySelector('#logoMode .chip[data-m="logo"]').dispatchEvent(
+      new win.Event('click', { bubbles: true }));
+    if ($('logoDrop').hidden) throw new Error('upload zone hidden');
+    doc.querySelector('#logoMode .chip[data-m="plain"]').dispatchEvent(
+      new win.Event('click', { bubbles: true }));
+    if (!$('logoDrop').hidden) throw new Error('upload zone still showing');
+  });
+  step('no stray text renders at the top of the page', () => {
+    const first = doc.body.textContent.replace(/\s+/g, ' ').trim().slice(0, 40);
+    if (/^["'>\/]/.test(first)) throw new Error('stray markup: ' + first);
+    if (!doc.head.querySelector('style')) throw new Error('<style> fell out of <head>');
+  });
 
   console.log('\n== guards ==');
   step('empty input clears the canvas', () => {

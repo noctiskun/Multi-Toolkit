@@ -1647,6 +1647,9 @@ PAGE = r"""<!doctype html>
   --r-lg:7px;
 }
 *{box-sizing:border-box}
+/* Author styles beat the UA sheet, so a rule like .row{display:flex} would
+   otherwise override the built-in [hidden]{display:none}. Restate it. */
+[hidden]{display:none!important}
 ::selection{background:var(--steel);color:var(--void)}
 html{color-scheme:dark}
 body{

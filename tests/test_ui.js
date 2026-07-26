@@ -178,6 +178,50 @@ setTimeout(() => {
     if ($('qrLogoPctVal').textContent !== '30%') throw new Error($('qrLogoPctVal').textContent);
   });
 
+  console.log('\n== theme ==');
+  step('starts on a resolved theme', () => {
+    const t = doc.documentElement.getAttribute('data-theme');
+    if (t !== 'dark' && t !== 'light') throw new Error('theme=' + t);
+  });
+  step('toggling flips the chassis and relabels the control', () => {
+    const before = doc.documentElement.getAttribute('data-theme');
+    $('themeBtn').dispatchEvent(new win.Event('click', { bubbles: true }));
+    const after = doc.documentElement.getAttribute('data-theme');
+    if (after === before) throw new Error('theme did not change');
+    if (!$('themeBtn').getAttribute('aria-label').includes(before))
+      throw new Error('aria-label=' + $('themeBtn').getAttribute('aria-label'));
+    $('themeBtn').dispatchEvent(new win.Event('click', { bubbles: true }));
+    if (doc.documentElement.getAttribute('data-theme') !== before)
+      throw new Error('did not toggle back');
+  });
+  step('theme control carries no emoji', () => {
+    if (/[\u2600-\u27BF\u{1F300}-\u{1F9FF}]/u.test($('themeBtn').textContent))
+      throw new Error('emoji found');
+    if (!$('themeBtn').querySelector('svg')) throw new Error('no svg glyph');
+  });
+
+  console.log('\n== qr: logo is optional ==');
+  step('defaults to a plain code with no upload', () => {
+    doc.querySelector('.tab[data-tab="qr"]').dispatchEvent(
+      new win.Event('click', { bubbles: true }));
+    const chosen = doc.querySelector('#qrLogoMode .chip.active');
+    if (!chosen || chosen.dataset.m !== 'plain') throw new Error('not plain by default');
+    if (!$('qrLogoDrop').classList.contains('hide'))
+      throw new Error('upload zone showing for a plain code');
+  });
+  step('choosing "with a logo" reveals the upload', () => {
+    doc.querySelector('#qrLogoMode .chip[data-m="logo"]').dispatchEvent(
+      new win.Event('click', { bubbles: true }));
+    if ($('qrLogoDrop').classList.contains('hide'))
+      throw new Error('upload zone still hidden');
+  });
+  step('going back to plain hides it again', () => {
+    doc.querySelector('#qrLogoMode .chip[data-m="plain"]').dispatchEvent(
+      new win.Event('click', { bubbles: true }));
+    if (!$('qrLogoDrop').classList.contains('hide')) throw new Error('still showing');
+    if (!$('qrLogoOpts').classList.contains('hide')) throw new Error('opts showing');
+  });
+
   console.log('\n== video panel ==');
   const goTab = n => doc.querySelector(`.tab[data-tab="${n}"]`)
     .dispatchEvent(new win.Event('click', { bubbles: true }));
