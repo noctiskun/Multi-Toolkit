@@ -10,7 +10,7 @@ python multi_toolkit.py
 
 That's the whole installation. Your browser opens automatically.
 
-> **[Try the QR generator in your browser →](https://<your-username>.github.io/multi-toolkit/)**
+> **[Try the QR generator in your browser →](https://noctiskun.github.io/multi-toolkit/)**
 > QR encoding needs no server, so that one feature runs live on the project page. Everything else needs the local app — see [Why the live page can't run everything](#why-the-live-page-cant-run-everything).
 
 ---
