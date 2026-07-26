@@ -1,0 +1,3251 @@
+#!/usr/bin/env python3
+"""
+Multi Toolkit — a local, cross-platform workbench for PDFs, media & QR codes.
+
+The browser is the interface, so there is no GUI toolkit to install. A tiny
+standard-library web server does the work; everything runs on your machine and
+nothing is uploaded anywhere.
+
+PDF
+---
+  • Merge      — combine many PDFs (drag rows to reorder), optional bookmarks
+  • Split      — VISUAL page preview: click between pages to place cut points,
+                 or click pages to extract them; plus every-page / every-N /
+                 text ranges / reorder
+  • Compress   — lossless cleanup, or strong image recompression/downscaling
+  • Convert    — Office → PDF (Word/PowerPoint/Excel)   [needs LibreOffice]
+                 PDF → Word (.docx)
+                 PDF → PowerPoint (.pptx, page-image slides)
+                 PDF → Images (PNG/JPG, zipped)
+                 Images → PDF (combined, in list order)
+
+Photo & Video
+-------------
+  • YouTube    — paste a URL, pick resolution + format, download with live
+                 progress (%, speed, ETA). Uses yt-dlp.
+                 Formats: "QuickTime mp4" downloads max-res then re-encodes
+                 to HEVC/H.264 (hardware-accelerated where available) so 4K
+                 plays natively on macOS; "Original codec" keeps YouTube's
+                 VP9/AV1 (max quality — use VLC/IINA); "Native H.264" needs
+                 no conversion but YouTube caps it at ~1080p.
+  • Reels      — the same engine pointed at Instagram / TikTok / Shorts, plus
+                 9:16 reframing: blurred backdrop (nothing cropped), crop to
+                 fill, or black bars. Canvas 1080x1920, 720x1280 or 1080x1350.
+                 Can borrow cookies from an installed browser for posts that
+                 need a signed-in session.
+  • Image      — load from a URL or a local file, drag a crop box (free or
+                 locked to 1:1 / 4:5 / 9:16 / 16:9 / 3:2), rotate, flip,
+                 grayscale, resize, then export PNG / JPG / WebP.
+  • QR Code    — links, plain text, Wi-Fi, email, SMS, phone, contact card or
+                 coordinates. Square / dot / rounded modules, any colours,
+                 transparent background, and a CENTRE LOGO — drop in a PNG and
+                 optionally flatten it to a silhouette so it reads as part of
+                 the code. Live preview; error correction is forced to H when
+                 a logo is present, and the app warns when a choice is likely
+                 to hurt scannability.
+                 ffmpeg is required for anything above ~720p.
+                 Only download videos you own or have permission to save.
+
+Quality-of-life
+---------------
+  • Files are uploaded once and cached server-side under a token, so repeated
+    operations on big PDFs don't re-send the bytes.
+  • Every PDF row shows a first-page thumbnail and a page count.
+  • Drag rows to reorder; image files show their own previews.
+
+Dependencies
+------------
+Core (always): pypdf — auto-installed on first run.
+Installed automatically the first time a feature needs them (pip wheels, no
+system tools required): pypdfium2, python-pptx, pdf2docx, pikepdf, Pillow,
+yt-dlp, qrcode.
+
+LibreOffice (OPTIONAL, only for Office→PDF): the one piece that can't be a pip
+wheel. Free, cross-platform. If it's missing the app still runs and tells you
+how to get it:  https://www.libreoffice.org/download
+
+ffmpeg (OPTIONAL, needed for max-resolution YouTube and for all 9:16
+reframing): YouTube serves >720p video and audio as separate streams; ffmpeg
+merges them. macOS: brew install ffmpeg
+Windows: winget install Gyan.FFmpeg   Linux: apt install ffmpeg
+
+Run
+---
+    python multi_toolkit.py
+
+Opens in your default browser automatically. Ctrl-C in the terminal to stop.
+"""
+
+import base64
+import importlib
+import io
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import traceback
+import uuid
+import zipfile
+import webbrowser
+from collections import OrderedDict
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+
+# --------------------------------------------------------------------------- #
+#  Dependency bootstrap
+# --------------------------------------------------------------------------- #
+_INSTALL_LOCK = threading.Lock()
+
+
+def ensure(pkg, import_name=None):
+    """Import a package, installing it via pip on demand. Returns module or None."""
+    name = import_name or pkg
+    try:
+        return importlib.import_module(name)
+    except ImportError:
+        pass
+    with _INSTALL_LOCK:
+        try:  # re-check inside the lock (another thread may have installed it)
+            return importlib.import_module(name)
+        except ImportError:
+            pass
+        print(f"[setup] installing '{pkg}' ...")
+        for extra in ([], ["--user"], ["--break-system-packages"]):
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", "--quiet", *extra, pkg]
+                )
+                importlib.invalidate_caches()
+                return importlib.import_module(name)
+            except Exception:  # noqa: BLE001
+                continue
+        print(f"[setup] could not install '{pkg}'.")
+        return None
+
+
+class FeatureError(RuntimeError):
+    """User-facing error (sent back as a readable message, not a traceback)."""
+
+
+class CacheMiss(RuntimeError):
+    """A file token is no longer cached; the client should resend the bytes."""
+
+
+if ensure("pypdf") is None:
+    sys.exit("ERROR: 'pypdf' is required and could not be installed automatically.\n"
+             "Try:  pip install pypdf")
+from pypdf import PdfReader, PdfWriter  # noqa: E402
+
+
+def need(pkg, import_name=None, hint=None):
+    mod = ensure(pkg, import_name)
+    if mod is None:
+        raise FeatureError(hint or f"Could not install '{pkg}'. Try: pip install {pkg}")
+    return mod
+
+
+def office_binary():
+    return shutil.which("soffice") or shutil.which("libreoffice")
+
+
+def gs_binary():
+    return shutil.which("gs") or shutil.which("gswin64c") or shutil.which("gswin32c")
+
+
+def ffmpeg_binary():
+    return shutil.which("ffmpeg")
+
+
+def safe_stem(name):
+    stem = os.path.splitext(os.path.basename(name or "file"))[0]
+    stem = re.sub(r"[^\w.\- ]+", "_", stem).strip() or "file"
+    return stem
+
+
+# --------------------------------------------------------------------------- #
+#  Server-side file cache (upload once, operate many times)
+# --------------------------------------------------------------------------- #
+_CACHE_LOCK = threading.Lock()
+_FILE_CACHE: "OrderedDict[str, tuple[str, bytes]]" = OrderedDict()
+_CACHE_MAX_FILES = 64
+_CACHE_MAX_BYTES = 600 * 1024 * 1024  # 600 MB
+
+
+def cache_put(name, data):
+    token = uuid.uuid4().hex
+    with _CACHE_LOCK:
+        _FILE_CACHE[token] = (name, data)
+        # Evict oldest entries beyond the caps.
+        while (len(_FILE_CACHE) > _CACHE_MAX_FILES
+               or sum(len(d) for _, d in _FILE_CACHE.values()) > _CACHE_MAX_BYTES):
+            if len(_FILE_CACHE) <= 1:
+                break
+            _FILE_CACHE.popitem(last=False)
+    return token
+
+
+def cache_get(token):
+    with _CACHE_LOCK:
+        item = _FILE_CACHE.get(token)
+        if item is not None:
+            _FILE_CACHE.move_to_end(token)  # LRU touch
+        return item
+
+
+def resolve_files(items):
+    """Turn client file refs ({token} or {name,data}) into {name, bytes} dicts.
+
+    If a file arrives with both token and data, the data wins and refreshes
+    the cache. A token that's no longer cached raises CacheMiss (HTTP 409) so
+    the client can transparently resend the bytes.
+    """
+    out = []
+    for it in items or []:
+        name = it.get("name", "file")
+        if it.get("data"):
+            data = base64.b64decode(it["data"])
+            token = cache_put(name, data)
+        elif it.get("token"):
+            hit = cache_get(it["token"])
+            if hit is None:
+                raise CacheMiss(name)
+            name, data = hit
+            token = it["token"]
+        else:
+            raise FeatureError(f"File entry for “{name}” has neither data nor token.")
+        out.append({"name": name, "bytes": data, "token": token})
+    return out
+
+
+# --------------------------------------------------------------------------- #
+#  Inspect: page counts + thumbnails for the visual UI
+# --------------------------------------------------------------------------- #
+_THUMB_CAP = 600          # pages beyond this render as number-only cards
+_THUMB_WIDTH = 150        # px width of split-grid thumbnails
+_COVER_WIDTH = 96         # px width of file-row cover thumbnails
+
+
+def _render_thumb(page, width):
+    w_pt, _h_pt = page.get_size()
+    scale = max(0.05, width / max(1.0, w_pt))
+    pil = page.render(scale=scale).to_pil()
+    if pil.mode != "RGB":
+        pil = pil.convert("RGB")
+    buf = io.BytesIO()
+    pil.save(buf, "JPEG", quality=72)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def op_inspect(file, thumbs="cover"):
+    """Return page count and thumbnail(s) for a PDF.
+
+    thumbs: 'none' | 'cover' (first page only) | 'all' (every page, capped)
+    """
+    pdfium = need("pypdfium2")
+    try:
+        doc = pdfium.PdfDocument(file["bytes"])
+    except Exception:  # noqa: BLE001
+        raise FeatureError(f"“{file['name']}” doesn't look like a readable PDF.")
+    n = len(doc)
+    result = {"pages": n, "token": file["token"], "cover": None, "thumbs": None}
+    try:
+        if thumbs == "cover" and n:
+            result["cover"] = _render_thumb(doc[0], _COVER_WIDTH)
+        elif thumbs == "all" and n:
+            imgs = []
+            for i in range(min(n, _THUMB_CAP)):
+                imgs.append(_render_thumb(doc[i], _THUMB_WIDTH))
+            result["thumbs"] = imgs
+            result["cover"] = imgs[0]
+    finally:
+        doc.close()
+    return result
+
+
+# --------------------------------------------------------------------------- #
+#  Core operations  (each returns a list of (filename, bytes), info string)
+# --------------------------------------------------------------------------- #
+def op_merge(files, bookmarks=True):
+    writer = PdfWriter()
+    cursor = 0
+    for f in files:
+        reader = PdfReader(io.BytesIO(f["bytes"]))
+        if reader.is_encrypted:
+            try:
+                reader.decrypt("")
+            except Exception:  # noqa: BLE001
+                pass
+        start = cursor
+        for page in reader.pages:
+            writer.add_page(page)
+            cursor += 1
+        if bookmarks and cursor > start:
+            try:
+                writer.add_outline_item(safe_stem(f["name"]), start)
+            except Exception:  # noqa: BLE001
+                pass
+    buf = io.BytesIO()
+    writer.write(buf)
+    return [("merged.pdf", buf.getvalue())], \
+        f"Merged {len(files)} files ({cursor} pages) into merged.pdf"
+
+
+def _parse_ranges(spec, total):
+    out = []
+    for chunk in str(spec).split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "-" in chunk:
+            a, b = chunk.split("-", 1)
+            a = int(a) if a.strip() else 1
+            b = int(b) if b.strip() else total
+        else:
+            a = b = int(chunk)
+        a = max(1, a)
+        b = min(total, b)
+        if a <= b:
+            out.append((a, b))
+    if not out:
+        raise FeatureError("No valid page ranges were parsed.")
+    return out
+
+
+def op_split(file, mode="each", ranges="", every_n=1, pages=None):
+    reader = PdfReader(io.BytesIO(file["bytes"]))
+    if reader.is_encrypted:
+        try:
+            reader.decrypt("")
+        except Exception:  # noqa: BLE001
+            pass
+    total = len(reader.pages)
+    stem = safe_stem(file["name"])
+    results = []
+
+    def write_pages(idxs, label):
+        w = PdfWriter()
+        for i in idxs:
+            w.add_page(reader.pages[i])
+        b = io.BytesIO()
+        w.write(b)
+        results.append((f"{stem}_{label}.pdf", b.getvalue()))
+
+    if mode == "each":
+        for i in range(total):
+            write_pages([i], f"p{i + 1:03d}")
+        info = f"Split into {total} single-page PDFs."
+    elif mode == "ranges":
+        for (a, b) in _parse_ranges(ranges, total):
+            write_pages(range(a - 1, b), f"{a}-{b}" if a != b else f"p{a}")
+        info = f"Split into {len(results)} PDFs."
+    elif mode == "every":
+        n = max(1, int(every_n))
+        for start in range(0, total, n):
+            end = min(start + n, total)
+            write_pages(range(start, end), f"{start + 1}-{end}")
+        info = f"Split into {len(results)} chunks of up to {n} pages."
+    elif mode == "extract":
+        sel = sorted({int(p) for p in (pages or []) if 1 <= int(p) <= total})
+        if not sel:
+            raise FeatureError("Select at least one page to extract.")
+        write_pages([p - 1 for p in sel], "extract")
+        info = f"Extracted {len(sel)} page(s) into one PDF."
+    elif mode == "reorder":
+        seq = [int(p) for p in (pages or []) if 1 <= int(p) <= total]
+        if not seq:
+            raise FeatureError("No pages left to write — restore at least one page.")
+        write_pages([p - 1 for p in seq], "reordered")
+        dropped = total - len(set(seq))
+        info = f"Rebuilt PDF with {len(seq)} page(s) in new order" + \
+               (f" ({dropped} removed)." if dropped > 0 else ".")
+    else:
+        raise FeatureError(f"Unknown split mode: {mode}")
+    return results, info
+
+
+COMPRESS_PRESETS = {
+    "high":     {"mode": "strong",   "quality": 35, "max_px": 1100},
+    "balanced": {"mode": "strong",   "quality": 60, "max_px": 1600},
+    "quality":  {"mode": "strong",   "quality": 85, "max_px": 2400},
+    "lossless": {"mode": "lossless", "quality": 0,  "max_px": 0},
+}
+
+
+def op_compress_preview(files):
+    """Compress every file with every preset; cache results, return sizes."""
+    pikepdf = need("pikepdf")
+    out = {"orig": sum(len(f["bytes"]) for f in files), "presets": {}}
+    for key, p in COMPRESS_PRESETS.items():
+        entries, total = [], 0
+        for f in files:
+            data = _compress_one(pikepdf, f["bytes"], p["mode"], p["quality"], p["max_px"])
+            if len(data) >= len(f["bytes"]):
+                data = f["bytes"]  # already optimal — keep original
+            name = f"{safe_stem(f['name'])}_compressed.pdf"
+            entries.append({"name": name, "size": len(data),
+                            "orig": len(f["bytes"]), "token": cache_put(name, data)})
+            total += len(data)
+        out["presets"][key] = {"total": total, "files": entries}
+    return out
+
+
+def op_compress(files, mode="strong", quality=60, max_px=1600):
+    pikepdf = need("pikepdf")
+    results = []
+    notes = []
+    for f in files:
+        data = f["bytes"]
+        orig = len(data)
+        out = _compress_one(pikepdf, data, mode, quality, max_px)
+        # If "compression" made it bigger (already optimized), keep the smaller.
+        if len(out) >= orig:
+            out = data
+            saved = "already optimal — kept original"
+        else:
+            saved = f"{orig // 1024} KB -> {len(out) // 1024} KB " \
+                    f"({100 * len(out) / max(1, orig):.0f}%)"
+        results.append((f"{safe_stem(f['name'])}_compressed.pdf", out))
+        notes.append(f"{safe_stem(f['name'])}: {saved}")
+    return results, "\n".join(notes)
+
+
+def _compress_one(pikepdf, data, mode, quality, max_px):
+    from pikepdf import Pdf, Name
+    # Strong mode: prefer Ghostscript if present (best general result).
+    if mode == "strong" and gs_binary():
+        try:
+            return _gs_compress(data, quality)
+        except Exception:  # noqa: BLE001
+            pass  # fall through to pikepdf path
+
+    pdf = Pdf.open(io.BytesIO(data))
+    if mode == "strong":
+        PdfImage = pikepdf.PdfImage
+        need("Pillow", "PIL.Image", "Pillow is needed for image recompression.")
+        for page in pdf.pages:
+            try:
+                images = page.images
+            except Exception:  # noqa: BLE001
+                continue
+            for _name, raw in list(images.items()):
+                try:
+                    pil = PdfImage(raw).as_pil_image()
+                    if pil.mode in ("RGBA", "P", "LA", "CMYK"):
+                        pil = pil.convert("RGB")
+                    if max(pil.size) > max_px:
+                        r = max_px / max(pil.size)
+                        pil = pil.resize((max(1, int(pil.width * r)),
+                                          max(1, int(pil.height * r))))
+                    buf = io.BytesIO()
+                    pil.save(buf, "JPEG", quality=int(quality), optimize=True)
+                    raw.write(buf.getvalue(), filter=Name("/DCTDecode"))
+                    raw.ColorSpace = Name("/DeviceGray") if pil.mode == "L" else Name("/DeviceRGB")
+                    raw.BitsPerComponent = 8
+                    if "/SMask" in raw:
+                        del raw.SMask
+                except Exception:  # noqa: BLE001
+                    continue  # leave this image untouched
+    bo = io.BytesIO()
+    pdf.save(bo, compress_streams=True,
+             object_stream_mode=pikepdf.ObjectStreamMode.generate)
+    return bo.getvalue()
+
+
+def _gs_compress(data, quality):
+    # Map a 0-100 quality to Ghostscript presets.
+    preset = "/screen" if quality < 45 else "/ebook" if quality < 75 else "/printer"
+    with tempfile.TemporaryDirectory() as td:
+        ip = os.path.join(td, "in.pdf")
+        op = os.path.join(td, "out.pdf")
+        with open(ip, "wb") as fh:
+            fh.write(data)
+        subprocess.run([gs_binary(), "-sDEVICE=pdfwrite",
+                        "-dCompatibilityLevel=1.5", f"-dPDFSETTINGS={preset}",
+                        "-dNOPAUSE", "-dQUIET", "-dBATCH",
+                        f"-sOutputFile={op}", ip], check=True, timeout=300)
+        with open(op, "rb") as fh:
+            return fh.read()
+
+
+# ---- conversions --------------------------------------------------------- #
+_OFFICE_LOCK = threading.Lock()
+OFFICE_EXTS = {"doc", "docx", "ppt", "pptx", "xls", "xlsx",
+               "odt", "odp", "ods", "rtf", "txt", "csv"}
+IMAGE_EXTS = {"png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff", "webp"}
+
+
+def conv_office2pdf(files, **_):
+    soffice = office_binary()
+    if not soffice:
+        raise FeatureError(
+            "LibreOffice is required for Office → PDF and was not found.\n"
+            "Install it (free, all platforms): https://www.libreoffice.org/download\n"
+            "macOS: brew install --cask libreoffice  •  Windows: winget install "
+            "TheDocumentFoundation.LibreOffice")
+    results = []
+    for f in files:
+        ext = os.path.splitext(f["name"])[1].lstrip(".").lower()
+        if ext not in OFFICE_EXTS:
+            raise FeatureError(f"“{f['name']}” isn't a supported Office file.")
+        with _OFFICE_LOCK, tempfile.TemporaryDirectory() as td:
+            ip = os.path.join(td, f"in.{ext}")
+            with open(ip, "wb") as fh:
+                fh.write(f["bytes"])
+            profile = os.path.join(td, "profile")
+            subprocess.run(
+                [soffice, "--headless", "--norestore", "--nolockcheck",
+                 f"-env:UserInstallation=file://{profile}",
+                 "--convert-to", "pdf", "--outdir", td, ip],
+                check=True, capture_output=True, timeout=300,
+                env=dict(os.environ, HOME=td))
+            outp = os.path.join(td, "in.pdf")
+            if not os.path.exists(outp):
+                raise FeatureError(f"LibreOffice could not convert “{f['name']}”.")
+            with open(outp, "rb") as fh:
+                results.append((f"{safe_stem(f['name'])}.pdf", fh.read()))
+    return results, f"Converted {len(results)} file(s) to PDF."
+
+
+def conv_pdf2docx(files, **_):
+    need("pdf2docx")
+    from pdf2docx import Converter
+    results = []
+    for f in files:
+        with tempfile.TemporaryDirectory() as td:
+            ip = os.path.join(td, "in.pdf")
+            op = os.path.join(td, "out.docx")
+            with open(ip, "wb") as fh:
+                fh.write(f["bytes"])
+            cv = Converter(ip)
+            try:
+                cv.convert(op)
+            finally:
+                cv.close()
+            with open(op, "rb") as fh:
+                results.append((f"{safe_stem(f['name'])}.docx", fh.read()))
+    return results, f"Converted {len(results)} PDF(s) to Word."
+
+
+def conv_pdf2pptx(files, dpi=150, **_):
+    pdfium = need("pypdfium2")
+    need("pptx", "pptx", "python-pptx is required.")
+    from pptx import Presentation
+    from pptx.util import Emu
+    results = []
+    scale = max(72, int(dpi)) / 72.0
+    for f in files:
+        doc = pdfium.PdfDocument(f["bytes"])
+        prs = Presentation()
+        w_pt, h_pt = doc[0].get_size()
+        prs.slide_width = Emu(int(w_pt / 72 * 914400))
+        prs.slide_height = Emu(int(h_pt / 72 * 914400))
+        blank = prs.slide_layouts[6]
+        for i in range(len(doc)):
+            pil = doc[i].render(scale=scale).to_pil()
+            ib = io.BytesIO()
+            pil.save(ib, "PNG")
+            ib.seek(0)
+            slide = prs.slides.add_slide(blank)
+            slide.shapes.add_picture(ib, 0, 0,
+                                     width=prs.slide_width, height=prs.slide_height)
+        bo = io.BytesIO()
+        prs.save(bo)
+        results.append((f"{safe_stem(f['name'])}.pptx", bo.getvalue()))
+    return results, f"Converted {len(results)} PDF(s) to PowerPoint."
+
+
+def conv_pdf2img(files, img_format="png", dpi=150, **_):
+    pdfium = need("pypdfium2")
+    fmt = "JPEG" if str(img_format).lower() in ("jpg", "jpeg") else "PNG"
+    ext = "jpg" if fmt == "JPEG" else "png"
+    scale = max(72, int(dpi)) / 72.0
+    results = []
+    for f in files:
+        doc = pdfium.PdfDocument(f["bytes"])
+        stem = safe_stem(f["name"])
+        for i in range(len(doc)):
+            pil = doc[i].render(scale=scale).to_pil()
+            if fmt == "JPEG" and pil.mode != "RGB":
+                pil = pil.convert("RGB")
+            ib = io.BytesIO()
+            if fmt == "JPEG":
+                pil.save(ib, fmt, quality=90)
+            else:
+                pil.save(ib, fmt)
+            results.append((f"{stem}_p{i + 1:03d}.{ext}", ib.getvalue()))
+    return results, f"Rendered {len(results)} page image(s)."
+
+
+def conv_img2pdf(files, **_):
+    need("Pillow", "PIL.Image", "Pillow is required for Images → PDF.")
+    from PIL import Image as PILImage
+    pages = []
+    for f in files:
+        ext = os.path.splitext(f["name"])[1].lstrip(".").lower()
+        if ext not in IMAGE_EXTS:
+            continue
+        im = PILImage.open(io.BytesIO(f["bytes"]))
+        pages.append(im.convert("RGB"))
+    if not pages:
+        raise FeatureError("No supported image files were provided.")
+    bo = io.BytesIO()
+    pages[0].save(bo, "PDF", save_all=True, append_images=pages[1:])
+    return [("images.pdf", bo.getvalue())], f"Combined {len(pages)} image(s) into one PDF."
+
+
+CONVERT_ROUTES = {
+    "office2pdf": conv_office2pdf,
+    "pdf2docx": conv_pdf2docx,
+    "pdf2pptx": conv_pdf2pptx,
+    "pdf2img": conv_pdf2img,
+    "img2pdf": conv_img2pdf,
+}
+
+
+# --------------------------------------------------------------------------- #
+#  YouTube download (yt-dlp)
+#
+#  Downloads run in a background thread as a "job" the client polls, so the UI
+#  can show real progress (%, speed, ETA) for multi-GB videos. Files land in a
+#  per-job temp dir and are streamed straight from disk (never held in RAM),
+#  then cleaned up after delivery.
+# --------------------------------------------------------------------------- #
+_YT_LOCK = threading.Lock()
+_YT_JOBS: dict = {}  # id -> {status,pct,msg,speed,eta,name,path,dir,error}
+
+
+def _yt_dlp():
+    return need("yt-dlp", "yt_dlp",
+                "Could not install 'yt-dlp'. Try: pip install yt-dlp")
+
+
+def _yt_format(height, compat="best"):
+    """Pick a format string for the requested max height + compatibility mode.
+
+    Why this matters: YouTube stores everything above 1080p ONLY in VP9/AV1.
+    QuickTime cannot decode VP9, so a "4K mp4" made by remuxing VP9 into an
+    mp4 container won't open on macOS even though the download itself worked.
+      best  → best streams regardless of codec (VP9/AV1; VLC/IINA territory)
+      h264  → native-H.264 streams only, plays anywhere but capped ~1080p
+      qt    → same as best; the worker then re-encodes to HEVC/H.264 mp4
+    """
+    h = f"[height<={int(height)}]" if height else ""
+    if not ffmpeg_binary():
+        return f"best{h}[ext=mp4]/best{h}/best"
+    if compat == "h264":
+        return (f"bestvideo{h}[vcodec^=avc1]+bestaudio[ext=m4a]/"
+                f"best{h}[ext=mp4]/best[ext=mp4]/best")
+    if compat == "qt":
+        # Prefer AV1 over VP9: identical quality tier, but decodes far faster
+        # (dav1d in software; hardware AV1 decode on Apple M3+/RTX 30+ with
+        # ffmpeg 7.1+). 10-bit VP9 (HDR) software decode is the classic
+        # bottleneck that pins conversion at ~1x realtime.
+        return (f"bestvideo{h}[vcodec^=av01]+bestaudio/"
+                f"bestvideo{h}+bestaudio/best{h}/best")
+    return f"bestvideo{h}+bestaudio/best{h}/best"
+
+
+_ENC_CACHE = None
+
+
+def _enc_works(vargs):
+    """ffmpeg lists hardware encoders even when the hardware/driver is absent
+    (e.g. hevc_nvenc with no NVIDIA GPU) — so verify with a 1-frame encode."""
+    try:
+        r = subprocess.run(
+            [ffmpeg_binary(), "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "color=black:size=640x360:rate=1",
+             "-frames:v", "1", *vargs, "-f", "null", "-"],
+            capture_output=True, timeout=30)
+        return r.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _encoder_args():
+    """Best available H.264/HEVC encoder: hardware if it actually works,
+    x264 software fallback. Result cached for the process lifetime."""
+    global _ENC_CACHE
+    if _ENC_CACHE is not None:
+        return _ENC_CACHE
+    try:
+        listed = subprocess.run([ffmpeg_binary(), "-hide_banner", "-encoders"],
+                                capture_output=True, text=True, timeout=15).stdout
+    except Exception:  # noqa: BLE001
+        listed = ""
+    candidates = []
+    if sys.platform == "darwin":
+        # hvc1 tag is REQUIRED for QuickTime to recognise HEVC in mp4.
+        # -prio_speed tells the media engine to favor throughput (ffmpeg 5.1+);
+        # plain variants follow as fallbacks for older ffmpeg builds.
+        candidates += [
+            ("hevc_videotoolbox",
+             ["-c:v", "hevc_videotoolbox", "-q:v", "55", "-tag:v", "hvc1",
+              "-prio_speed", "1"], "HEVC (hw)"),
+            ("hevc_videotoolbox",
+             ["-c:v", "hevc_videotoolbox", "-q:v", "55", "-tag:v", "hvc1"],
+             "HEVC (hw)"),
+            ("h264_videotoolbox",
+             ["-c:v", "h264_videotoolbox", "-b:v", "14M", "-prio_speed", "1"],
+             "H.264 (hw)"),
+            ("h264_videotoolbox",
+             ["-c:v", "h264_videotoolbox", "-b:v", "14M"], "H.264 (hw)"),
+        ]
+    candidates += [
+        ("hevc_nvenc", ["-c:v", "hevc_nvenc", "-cq", "24", "-tag:v", "hvc1"],
+         "HEVC (NVENC)"),
+        ("h264_nvenc", ["-c:v", "h264_nvenc", "-cq", "23"], "H.264 (NVENC)"),
+    ]
+    for name, vargs, label in candidates:
+        if name in listed and _enc_works(vargs):
+            _ENC_CACHE = (vargs, label)
+            return _ENC_CACHE
+    _ENC_CACHE = (["-c:v", "libx264", "-crf", "20", "-preset", "fast",
+                   "-pix_fmt", "yuv420p"], "H.264 (x264)")
+    return _ENC_CACHE
+
+
+def _decode_ladder(enc_label):
+    """Decode configurations to try, fastest first.
+
+    1. Full-GPU: decoded frames stay in GPU memory and go straight into the
+       hardware encoder — zero CPU involvement, zero 4K frame copies. This is
+       the difference between ~1x and several-x realtime for 4K60.
+    2. HW decode with frames downloaded to CPU (works with any encoder).
+    3. Plain software decode (always works).
+    A config that can't handle the stream fails at startup, and we fall
+    through to the next one."""
+    lad = []
+    if sys.platform == "darwin":
+        if "(hw)" in (enc_label or ""):
+            lad.append(["-hwaccel", "videotoolbox",
+                        "-hwaccel_output_format", "videotoolbox"])
+        lad.append(["-hwaccel", "videotoolbox"])
+    elif "NVENC" in (enc_label or ""):
+        lad.append(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+        lad.append(["-hwaccel", "cuda"])
+    lad.append([])
+    return lad
+
+
+def _convert_qt(job, src, duration):
+    """Re-encode to a QuickTime-friendly mp4, reporting progress via the job.
+    Tries the fastest decode pipeline first, falling back if the stream isn't
+    supported by a given hwaccel (fails within a second, so retries are cheap)."""
+    venc, enc_name = _encoder_args()
+    dst = os.path.splitext(src)[0] + ".qt.mp4"
+    last_err = "unknown error"
+    for dec in _decode_ladder(enc_name):
+        args = [ffmpeg_binary(), "-y", *dec, "-i", src,
+                *venc, "-c:a", "aac", "-b:a", "192k",
+                "-threads", "0", "-movflags", "+faststart",
+                "-progress", "pipe:1", "-nostats", "-loglevel", "error", dst]
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        with _YT_LOCK:
+            job.update(msg=f"Converting for QuickTime · {enc_name}",
+                       pct=0, speed=None, eta=None, rate=None)
+        fps = ""
+        for line in proc.stdout:  # ffmpeg -progress: out_time_*= is microseconds
+            line = line.strip()
+            if line.startswith("fps="):
+                fps = line.split("=", 1)[1].strip()
+            elif line.startswith("speed="):
+                sp = line.split("=", 1)[1].strip()
+                if sp and sp != "N/A":
+                    with _YT_LOCK:
+                        job["rate"] = sp + (f" · {fps} fps"
+                                            if fps and fps != "0.00" else "")
+            elif line.startswith(("out_time_ms=", "out_time_us=")) and duration:
+                try:
+                    us = int(line.split("=", 1)[1])
+                except ValueError:
+                    continue
+                with _YT_LOCK:
+                    job["pct"] = min(99.9, round(100 * (us / 1e6) / duration, 1))
+        proc.wait()
+        with _YT_LOCK:
+            job["rate"] = None
+        if proc.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst):
+            os.remove(src)
+            # tidy name: "Title [id].qt.mp4" -> "Title [id].mp4"
+            final = dst.replace(".qt.mp4", ".mp4")
+            if final != dst and not os.path.exists(final):
+                os.rename(dst, final)
+                dst = final
+            return dst, enc_name
+        last_err = (proc.stderr.read() or "")[-500:] or last_err
+        if os.path.exists(dst):
+            os.remove(dst)  # clear partial output before the next attempt
+    raise RuntimeError(f"ffmpeg conversion failed:\n{last_err}")
+
+
+_VERTICAL_SIZES = {"1080": (1080, 1920), "720": (720, 1280), "1350": (1080, 1350)}
+
+
+def _vertical_filters(mode, w, h):
+    """Filter graphs that turn any aspect ratio into a vertical canvas.
+
+    Returns a list to try in order — gblur is the nicer look but isn't in
+    every ffmpeg build, so boxblur follows as a fallback.
+    """
+    fit = f"scale={w}:{h}:force_original_aspect_ratio=decrease"
+    fill = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
+    if mode == "crop":
+        return [fill]
+    if mode == "pad":
+        return [f"{fit},pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black"]
+    # "blur": the reel look — filled blurred backdrop, whole frame on top
+    return [
+        f"split[a][b];[a]{fill},gblur=sigma=28[bg];[b]{fit}[fg];"
+        f"[bg][fg]overlay=(W-w)/2:(H-h)/2",
+        f"split[a][b];[a]{fill},boxblur=20:2[bg];[b]{fit}[fg];"
+        f"[bg][fg]overlay=(W-w)/2:(H-h)/2",
+    ]
+
+
+def _convert_vertical(job, src, duration, mode="blur", size="1080"):
+    """Re-frame a video to a vertical canvas, reporting progress via the job."""
+    venc, enc_name = _encoder_args()
+    w, h = _VERTICAL_SIZES.get(str(size), (1080, 1920))
+    dst = os.path.splitext(src)[0] + f".vertical.mp4"
+    label = {"blur": "blurred backdrop", "crop": "cropped to fill",
+             "pad": "black bars"}.get(mode, mode)
+    last_err = "unknown error"
+
+    for vf in _vertical_filters(mode, w, h):
+        args = [ffmpeg_binary(), "-y", "-i", src,
+                "-filter_complex" if "[" in vf else "-vf", vf,
+                *venc, "-c:a", "aac", "-b:a", "192k",
+                "-r", "30", "-threads", "0", "-movflags", "+faststart",
+                "-progress", "pipe:1", "-nostats", "-loglevel", "error", dst]
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        with _YT_LOCK:
+            job.update(msg=f"Reframing to {w}x{h} · {label}",
+                       pct=0, speed=None, eta=None, rate=None)
+        fps = ""
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("fps="):
+                fps = line.split("=", 1)[1].strip()
+            elif line.startswith("speed="):
+                sp = line.split("=", 1)[1].strip()
+                if sp and sp != "N/A":
+                    with _YT_LOCK:
+                        job["rate"] = sp + (f" · {fps} fps"
+                                            if fps and fps != "0.00" else "")
+            elif line.startswith(("out_time_ms=", "out_time_us=")) and duration:
+                try:
+                    us = int(line.split("=", 1)[1])
+                except ValueError:
+                    continue
+                with _YT_LOCK:
+                    job["pct"] = min(99.9, round(100 * (us / 1e6) / duration, 1))
+        proc.wait()
+        with _YT_LOCK:
+            job["rate"] = None
+        if proc.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst):
+            os.remove(src)
+            return dst, f"{w}x{h} {label} · {enc_name}"
+        last_err = (proc.stderr.read() or "")[-500:] or last_err
+        if os.path.exists(dst):
+            os.remove(dst)
+    raise RuntimeError(f"Vertical conversion failed:\n{last_err}")
+
+
+def op_yt_info(url, cookies=""):
+    yt = _yt_dlp()
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True,
+            "skip_download": True}
+    if cookies:
+        opts["cookiesfrombrowser"] = (cookies,)
+    try:
+        with yt.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:  # noqa: BLE001
+        raise FeatureError(f"Could not read that URL:\n{e}")
+    if info.get("_type") == "playlist":  # noplaylist usually handles this
+        entries = info.get("entries") or []
+        info = entries[0] if entries else info
+    heights = sorted({f.get("height") for f in info.get("formats", [])
+                      if f.get("height") and f.get("vcodec") not in (None, "none")},
+                     reverse=True)
+    return {
+        "title": info.get("title") or "video",
+        "uploader": info.get("uploader") or info.get("channel") or "",
+        "duration": info.get("duration") or 0,
+        "thumbnail": info.get("thumbnail") or "",
+        "heights": heights[:12],
+        "has_ffmpeg": bool(ffmpeg_binary()),
+    }
+
+
+def _yt_worker(job_id, url, height, compat, vertical="off",
+               vsize="1080", cookies=""):
+    yt = _yt_dlp()
+    job = _YT_JOBS[job_id]
+
+    def hook(d):
+        with _YT_LOCK:
+            if d.get("status") == "downloading":
+                tot = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                got = d.get("downloaded_bytes") or 0
+                job["pct"] = round(100.0 * got / tot, 1) if tot else None
+                job["speed"] = d.get("speed")
+                job["eta"] = d.get("eta")
+                job["msg"] = "Downloading"
+            elif d.get("status") == "finished":
+                job["pct"] = 100
+                job["speed"] = None
+                job["eta"] = None
+                job["msg"] = "Processing (merging streams)"
+
+    opts = {
+        "quiet": True, "no_warnings": True, "noplaylist": True,
+        # .120B = truncate the (possibly unicode) title to 120 bytes safely
+        "outtmpl": os.path.join(job["dir"], "%(title).120B [%(id)s].%(ext)s"),
+        "format": _yt_format(height, compat),
+        "progress_hooks": [hook],
+        "retries": 3,
+    }
+    if cookies:
+        # Instagram/private posts need a logged-in session; yt-dlp can borrow
+        # the cookies straight out of an installed browser.
+        opts["cookiesfrombrowser"] = (cookies,)
+    if compat == "h264" and ffmpeg_binary():
+        opts["merge_output_format"] = "mp4"
+    # compat 'best'/'qt': let yt-dlp pick a container that fits the codecs
+    # (webm/mkv) — forcing VP9 into mp4 is exactly what confuses QuickTime.
+    try:
+        with yt.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+
+        # Final file: yt-dlp reports it directly; fall back to biggest file.
+        path = None
+        for rd in (info or {}).get("requested_downloads") or []:
+            if rd.get("filepath") and os.path.isfile(rd["filepath"]):
+                path = rd["filepath"]
+                break
+        if not path:
+            paths = [os.path.join(job["dir"], p) for p in os.listdir(job["dir"])]
+            paths = [p for p in paths if os.path.isfile(p)
+                     and not p.endswith((".part", ".ytdl", ".temp"))]
+            if not paths:
+                raise RuntimeError("yt-dlp finished but produced no file.")
+            path = max(paths, key=os.path.getsize)
+
+        # What did we actually get? (verifiable answer to "was it really 4K?")
+        vfmt = ((info or {}).get("requested_formats") or [info or {}])[0]
+        w, h = vfmt.get("width"), vfmt.get("height")
+        vc = (vfmt.get("vcodec") or "?").split(".")[0]
+        detail = f"{w}×{h} · {vc}" if w and h else vc
+
+        dur = (info or {}).get("duration")
+        if vertical and vertical != "off":
+            if not ffmpeg_binary():
+                raise RuntimeError("Vertical reframing needs ffmpeg. Install it "
+                                   "and restart, or set Vertical to “Keep original”.")
+            path, note = _convert_vertical(job, path, dur, vertical, vsize)
+            detail += f" → {note}"
+        elif compat == "qt" and ffmpeg_binary():
+            path, enc = _convert_qt(job, path, dur)
+            detail += f" → {enc}"
+
+        with _YT_LOCK:
+            job.update(status="done", pct=100, msg="Done", detail=detail,
+                       path=path, name=os.path.basename(path))
+    except Exception as e:  # noqa: BLE001
+        with _YT_LOCK:
+            job.update(status="error", error=str(e), msg="Failed")
+
+
+def op_yt_start(url, height, compat="best", vertical="off",
+                vsize="1080", cookies=""):
+    if not url or not re.match(r"https?://", url.strip()):
+        raise FeatureError("That doesn't look like a URL. Paste the full "
+                           "https://… video link.")
+    if compat not in ("best", "h264", "qt"):
+        compat = "best"
+    if vertical not in ("off", "blur", "crop", "pad"):
+        vertical = "off"
+    if cookies not in ("", "chrome", "firefox", "safari", "edge", "brave",
+                       "chromium", "opera", "vivaldi"):
+        cookies = ""
+    job_id = uuid.uuid4().hex
+    _YT_JOBS[job_id] = {"status": "running", "pct": None, "msg": "Starting",
+                        "speed": None, "eta": None, "name": None, "path": None,
+                        "detail": None, "rate": None, "error": None,
+                        "dir": tempfile.mkdtemp(prefix="ytdl_")}
+    threading.Thread(target=_yt_worker,
+                     args=(job_id, url.strip(), height, compat, vertical,
+                           vsize, cookies), daemon=True).start()
+    return {"id": job_id}
+
+
+def _yt_cleanup(job_id):
+    with _YT_LOCK:
+        job = _YT_JOBS.pop(job_id, None)
+    if job and job.get("dir"):
+        shutil.rmtree(job["dir"], ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+#  QR codes
+# --------------------------------------------------------------------------- #
+_EC_LEVELS = {"L": 1, "M": 0, "Q": 3, "H": 2}   # qrcode.constants values
+_QR_MAX_PX = 4096
+
+
+def _hex_rgba(value, fallback=(0, 0, 0, 255)):
+    """'#rgb' / '#rrggbb' / '#rrggbbaa' / 'transparent' -> (r,g,b,a)."""
+    s = str(value or "").strip().lower()
+    if s in ("transparent", "none", ""):
+        return (0, 0, 0, 0)
+    s = s.lstrip("#")
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    if len(s) == 6:
+        s += "ff"
+    if len(s) != 8 or not re.fullmatch(r"[0-9a-f]{8}", s):
+        return fallback
+    return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4, 6))
+
+
+def _relative_luminance(rgba):
+    def chan(c):
+        c /= 255.0
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = rgba[0], rgba[1], rgba[2]
+    return 0.2126 * chan(r) + 0.7152 * chan(g) + 0.0722 * chan(b)
+
+
+def _contrast_ratio(a, b):
+    la, lb = _relative_luminance(a), _relative_luminance(b)
+    hi, lo = max(la, lb), min(la, lb)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def qr_payload(kind, fields):
+    """Build the string that actually goes into the QR code."""
+    f = {k: str(v or "").strip() for k, v in (fields or {}).items()}
+    kind = (kind or "text").lower()
+
+    def esc(s):  # Wi-Fi / vCard escaping
+        return re.sub(r"([\\;,:\"])", r"\\\1", s)
+
+    if kind == "url":
+        u = f.get("text", "")
+        if u and not re.match(r"^[a-z][a-z0-9+.\-]*:", u, re.I):
+            u = "https://" + u
+        return u
+    if kind == "wifi":
+        enc = (f.get("security") or "WPA").upper()
+        if enc == "NONE":
+            return f"WIFI:T:nopass;S:{esc(f.get('ssid',''))};;"
+        return ("WIFI:T:{t};S:{s};P:{p};{h}".format(
+            t=enc, s=esc(f.get("ssid", "")), p=esc(f.get("password", "")),
+            h="H:true;;" if f.get("hidden") in ("1", "true", "True") else ";"))
+    if kind == "email":
+        q = []
+        if f.get("subject"):
+            q.append("subject=" + _pct(f["subject"]))
+        if f.get("body"):
+            q.append("body=" + _pct(f["body"]))
+        return "mailto:" + f.get("to", "") + ("?" + "&".join(q) if q else "")
+    if kind == "sms":
+        return "SMSTO:{n}:{m}".format(n=f.get("phone", ""), m=f.get("message", ""))
+    if kind == "phone":
+        return "tel:" + f.get("phone", "")
+    if kind == "geo":
+        return "geo:{la},{lo}".format(la=f.get("lat", "0"), lo=f.get("lon", "0"))
+    if kind == "vcard":
+        name = f.get("name", "")
+        given, _, family = name.partition(" ")   # vCard N is Family;Given;...
+        lines = ["BEGIN:VCARD", "VERSION:3.0",
+                 f"N:{esc(family or name)};{esc(given if family else '')};;;",
+                 f"FN:{esc(name)}"]
+        if f.get("org"):
+            lines.append("ORG:" + esc(f["org"]))
+        if f.get("title"):
+            lines.append("TITLE:" + esc(f["title"]))
+        if f.get("phone"):
+            lines.append("TEL;TYPE=CELL:" + f["phone"])
+        if f.get("email"):
+            lines.append("EMAIL:" + f["email"])
+        if f.get("url"):
+            lines.append("URL:" + f["url"])
+        lines.append("END:VCARD")
+        return "\n".join(lines)
+    return f.get("text", "")
+
+
+def _pct(s):
+    from urllib.parse import quote
+    return quote(s, safe="")
+
+
+def _silhouette(img, colour):
+    """Flatten any logo to a single-colour silhouette (the look in the sample)."""
+    from PIL import Image
+    img = img.convert("RGBA")
+    alpha = img.getchannel("A")
+    # If the image is essentially opaque, derive the shape from darkness instead.
+    if alpha.getextrema()[0] > 250:
+        grey = img.convert("L")
+        mask = grey.point(lambda v: 255 if v < 128 else 0).convert("L")
+    else:
+        mask = alpha.point(lambda v: 255 if v > 40 else 0).convert("L")
+    flat = Image.new("RGBA", img.size, tuple(colour))
+    flat.putalpha(mask)
+    return flat
+
+
+def op_qr(data="", ec="H", target_px=1024, border=4, fg="#000000", bg="#ffffff",
+          style="square", logo_data=None, logo_pct=22, logo_style="original",
+          pad=True, pad_shape="rounded", pad_pct=6, fmt="png"):
+    """Render a QR code, optionally with a centred logo. Returns a dict."""
+    qrcode = need("qrcode")
+    need("Pillow", "PIL")
+    from PIL import Image, ImageDraw
+
+    data = data if isinstance(data, str) else str(data or "")
+    if not data.strip():
+        raise FeatureError("Type something to encode first.")
+
+    ec = (ec or "H").upper()
+    if ec not in _EC_LEVELS:
+        ec = "H"
+    if logo_data and ec != "H":
+        ec = "H"          # a logo eats modules; H (~30% recovery) is the floor
+    border = max(0, min(16, int(border)))
+    logo_pct = max(0, min(40, float(logo_pct)))
+
+    try:
+        q = qrcode.QRCode(error_correction=_EC_LEVELS[ec], box_size=1,
+                          border=border)
+        q.add_data(data)
+        q.make(fit=True)
+    except Exception as e:                                    # noqa: BLE001
+        raise FeatureError(f"Could not encode that: {e}")
+
+    matrix = q.get_matrix()
+    n = len(matrix)                       # side length in modules, incl. border
+    mods = n - 2 * border                 # the code itself
+
+    target_px = max(128, min(_QR_MAX_PX, int(target_px or 1024)))
+    box = max(1, round(target_px / n))
+    size = n * box
+
+    fg_rgba, bg_rgba = _hex_rgba(fg, (0, 0, 0, 255)), _hex_rgba(bg, (255, 255, 255, 255))
+    img = Image.new("RGBA", (size, size), bg_rgba)
+    draw = ImageDraw.Draw(img)
+
+    def is_finder(mx, my):
+        return ((mx < 7 and my < 7)
+                or (mx >= mods - 7 and my < 7)
+                or (mx < 7 and my >= mods - 7))
+
+    style = (style or "square").lower()
+    radius = max(1, int(box * 0.32))
+    for y, row in enumerate(matrix):
+        for x, on in enumerate(row):
+            if not on:
+                continue
+            x0, y0 = x * box, y * box
+            x1, y1 = x0 + box - 1, y0 + box - 1
+            # Finder patterns always stay crisp squares — scanners lock onto them.
+            if style == "square" or is_finder(x - border, y - border):
+                draw.rectangle([x0, y0, x1, y1], fill=fg_rgba)
+            elif style == "dots":
+                draw.ellipse([x0, y0, x1, y1], fill=fg_rgba)
+            else:  # rounded
+                draw.rounded_rectangle([x0, y0, x1, y1], radius=radius, fill=fg_rgba)
+
+    logo_note = ""
+    if logo_data and logo_pct > 0:
+        try:
+            raw = base64.b64decode(logo_data.split(",")[-1])
+            logo = Image.open(io.BytesIO(raw))
+            logo.load()
+        except Exception:                                     # noqa: BLE001
+            raise FeatureError("That logo file couldn't be read as an image.")
+        logo = logo.convert("RGBA")
+        if (logo_style or "original") == "silhouette":
+            logo = _silhouette(logo, fg_rgba)
+
+        code_px = mods * box                         # drawable area, sans border
+        want = max(1, int(code_px * logo_pct / 100.0))
+        logo.thumbnail((want, want), Image.LANCZOS)
+        lw, lh = logo.size
+        cx, cy = size // 2, size // 2
+        px = max(0, int(max(lw, lh) * max(0, min(50, float(pad_pct))) / 100.0))
+
+        if pad:
+            pw, ph = lw + 2 * px, lh + 2 * px
+            bx = [cx - pw // 2, cy - ph // 2, cx + pw // 2, cy + ph // 2]
+            pad_fill = bg_rgba if bg_rgba[3] else (255, 255, 255, 255)
+            if pad_shape == "circle":
+                d = max(pw, ph)
+                draw.ellipse([cx - d // 2, cy - d // 2, cx + d // 2, cy + d // 2],
+                             fill=pad_fill)
+            elif pad_shape == "square":
+                draw.rectangle(bx, fill=pad_fill)
+            else:
+                draw.rounded_rectangle(bx, radius=max(2, int(min(pw, ph) * 0.18)),
+                                       fill=pad_fill)
+
+        img.alpha_composite(logo, (cx - lw // 2, cy - lh // 2))
+        covered = (lw * lh) / float(code_px * code_px) * 100
+        if covered > 25:
+            logo_note = (f"Logo covers ~{covered:.0f}% of the code — above ~25% "
+                         "some scanners start to struggle. Test before you print.")
+
+    out = io.BytesIO()
+    if fmt == "jpg":
+        flat = Image.new("RGB", img.size,
+                         bg_rgba[:3] if bg_rgba[3] else (255, 255, 255))
+        flat.paste(img, mask=img.getchannel("A"))
+        flat.save(out, "JPEG", quality=95)
+        mime = "image/jpeg"
+    else:
+        img.save(out, "PNG", optimize=True)
+        mime = "image/png"
+    png_b64 = base64.b64encode(out.getvalue()).decode()
+
+    warn = []
+    if logo_note:
+        warn.append(logo_note)
+    if border < 4:
+        warn.append(f"Quiet zone is {border} modules — the spec wants 4. Below "
+                    "that, scanners lose the edge against a busy background.")
+    if not bg_rgba[3]:
+        warn.append("Transparent background: only scannable on a light surface. "
+                    "On anything dark it becomes invisible.")
+    if bg_rgba[3] and _contrast_ratio(fg_rgba, bg_rgba) < 3.0:
+        warn.append("Foreground and background are too close in brightness — "
+                    "many scanners will fail. Darken the foreground.")
+    elif _relative_luminance(fg_rgba) > _relative_luminance(bg_rgba):
+        warn.append("Light code on a dark background — some older scanners "
+                    "only read dark-on-light. Test it.")
+    if len(data) > 1200:
+        warn.append("That's a lot of data — the code is dense and needs a "
+                    "clean, large print to scan reliably.")
+
+    return {"image": png_b64, "mime": mime, "size": size, "modules": mods,
+            "version": q.version, "ec": ec, "bytes": len(out.getvalue()),
+            "chars": len(data), "warn": " ".join(warn)}
+
+
+# --------------------------------------------------------------------------- #
+#  Image fetch / crop / resize
+# --------------------------------------------------------------------------- #
+_IMG_PREVIEW_PX = 1400
+_IMG_MAX_BYTES = 80 * 1024 * 1024
+
+
+def _open_image(raw, label="image"):
+    need("Pillow", "PIL")
+    from PIL import Image, ImageOps
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+    except Exception:                                         # noqa: BLE001
+        raise FeatureError(f"That {label} couldn't be read as an image.")
+    return ImageOps.exif_transpose(img)
+
+
+def img_describe(raw, name="image"):
+    """Preview + dimensions for the crop UI. Original bytes stay server-side."""
+    need("Pillow", "PIL")
+    from PIL import Image
+    img = _open_image(raw, name)
+    w, h = img.size
+    fmt = (img.format or "PNG").upper()
+    prev = img.convert("RGB") if img.mode not in ("RGB", "L") else img
+    prev = prev.copy()
+    prev.thumbnail((_IMG_PREVIEW_PX, _IMG_PREVIEW_PX), Image.LANCZOS)
+    buf = io.BytesIO()
+    prev.convert("RGB").save(buf, "JPEG", quality=86)
+    return {"name": name, "width": w, "height": h, "format": fmt,
+            "bytes": len(raw), "preview": base64.b64encode(buf.getvalue()).decode()}
+
+
+def op_img_process(raw, name="image", crop=None, out_w=None, out_h=None,
+                   fmt="png", quality=90, rotate=0, flip=False, grayscale=False):
+    need("Pillow", "PIL")
+    from PIL import Image
+    img = _open_image(raw, name)
+    w, h = img.size
+
+    if crop:
+        x = max(0, min(w - 1, int(crop.get("x", 0))))
+        y = max(0, min(h - 1, int(crop.get("y", 0))))
+        cw = max(1, min(w - x, int(crop.get("w", w))))
+        ch = max(1, min(h - y, int(crop.get("h", h))))
+        img = img.crop((x, y, x + cw, y + ch))
+
+    rotate = int(rotate or 0) % 360
+    if rotate in (90, 180, 270):
+        img = img.rotate(-rotate, expand=True)
+    if flip:
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+    if grayscale:
+        img = img.convert("L").convert("RGBA" if fmt == "png" else "RGB")
+
+    if out_w or out_h:
+        cw, ch = img.size
+        tw = int(out_w) if out_w else max(1, round(cw * int(out_h) / ch))
+        th = int(out_h) if out_h else max(1, round(ch * int(out_w) / cw))
+        tw, th = max(1, min(20000, tw)), max(1, min(20000, th))
+        img = img.resize((tw, th), Image.LANCZOS)
+
+    stem = re.sub(r"[^\w.\- ]+", "_", (name or "image").rsplit(".", 1)[0]) or "image"
+    buf = io.BytesIO()
+    fmt = (fmt or "png").lower()
+    if fmt in ("jpg", "jpeg"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        rgba = img.convert("RGBA")
+        bg.paste(rgba, mask=rgba.getchannel("A"))
+        bg.save(buf, "JPEG", quality=int(quality), optimize=True, progressive=True)
+        ext = "jpg"
+    elif fmt == "webp":
+        img.convert("RGBA").save(buf, "WEBP", quality=int(quality), method=5)
+        ext = "webp"
+    else:
+        img.convert("RGBA").save(buf, "PNG", optimize=True)
+        ext = "png"
+    data = buf.getvalue()
+    return ([(f"{stem}_{img.size[0]}x{img.size[1]}.{ext}", data)],
+            f"{img.size[0]}×{img.size[1]} · {len(data)/1024:.0f} KB")
+
+
+def op_img_fetch(url):
+    """Download an image by URL so it can be cropped/resized locally."""
+    from urllib.request import Request, urlopen
+    url = (url or "").strip()
+    if not re.match(r"^https?://", url, re.I):
+        raise FeatureError("Paste a full image URL starting with http:// or https://")
+    req = Request(url, headers={
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/125.0 Safari/537.36"),
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    })
+    try:
+        with urlopen(req, timeout=30) as r:
+            ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip()
+            raw = r.read(_IMG_MAX_BYTES + 1)
+    except Exception as e:  # noqa: BLE001
+        raise FeatureError(f"Could not fetch that URL:\n{e}")
+    if len(raw) > _IMG_MAX_BYTES:
+        raise FeatureError("That image is over 80 MB — save it locally and drop "
+                           "it in instead.")
+    if ctype and not ctype.startswith("image/") and "octet-stream" not in ctype:
+        raise FeatureError(f"That URL returned {ctype or 'no image'}, not an "
+                           "image. Use the direct link to the image file "
+                           "(right-click → Copy image address).")
+    name = os.path.basename(urlparse(url).path) or "image"
+    if "." not in name:
+        name += "." + (ctype.split("/")[-1] if ctype else "jpg").replace("jpeg", "jpg")
+    return raw, name
+
+
+# --------------------------------------------------------------------------- #
+#  HTTP server
+# --------------------------------------------------------------------------- #
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"  # honor Content-Length for large bodies
+
+    def _raw(self, code, body, ctype="text/plain; charset=utf-8", extra=None):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra or {}).items():
+            # HTTP headers must be Latin-1; never let an exotic char crash the body write.
+            safe = str(v).encode("latin-1", "replace").decode("latin-1")
+            self.send_header(k, safe)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, obj, code=200):
+        self._raw(code, json.dumps(obj), "application/json")
+
+    def _deliver(self, results, info):
+        """Send a single file, or zip multiple results."""
+        from urllib.parse import quote
+        if not results:
+            self._raw(400, "Nothing was produced.")
+            return
+        if len(results) == 1:
+            name, data = results[0]
+            ascii_name = name.encode("ascii", "ignore").decode() or "download"
+            self._raw(200, data, _guess_ctype(name),
+                      extra={"X-Filename": quote(name), "X-Info": quote(info),
+                             "Content-Disposition":
+                                 f"attachment; filename=\"{ascii_name}\"; "
+                                 f"filename*=UTF-8''{quote(name)}"})
+        else:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                for name, data in results:
+                    z.writestr(name, data)
+            self._raw(200, buf.getvalue(), "application/zip",
+                      extra={"X-Filename": "results.zip",
+                             "X-Info": quote(info + f"\n({len(results)} files, zipped)"),
+                             "Content-Disposition": 'attachment; filename="results.zip"'})
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            self._raw(200, PAGE, "text/html; charset=utf-8")
+        elif self.path == "/capabilities":
+            self._json({"libreoffice": bool(office_binary()),
+                        "ghostscript": bool(gs_binary()),
+                        "ffmpeg": bool(ffmpeg_binary())})
+        elif self.path.startswith("/yt_progress"):
+            job = _YT_JOBS.get(self._query().get("id", ""))
+            if not job:
+                self._raw(404, "Unknown download job.")
+                return
+            with _YT_LOCK:
+                pub = {k: job.get(k) for k in
+                       ("status", "pct", "msg", "speed", "eta", "name", "detail", "rate", "error")}
+            self._json(pub)
+        elif self.path.startswith("/yt_file"):
+            self._yt_send(self._query().get("id", ""))
+        else:
+            self._raw(404, "Not found")
+
+    def _query(self):
+        from urllib.parse import urlparse, parse_qs
+        q = parse_qs(urlparse(self.path).query)
+        return {k: v[0] for k, v in q.items()}
+
+    def _yt_send(self, job_id):
+        """Stream a finished video from disk (never buffered in RAM)."""
+        from urllib.parse import quote
+        job = _YT_JOBS.get(job_id)
+        if not job or job.get("status") != "done" or not job.get("path"):
+            self._raw(404, "No finished download with that id.")
+            return
+        path, name = job["path"], job["name"]
+        try:
+            size = os.path.getsize(path)
+            ascii_name = name.encode("ascii", "ignore").decode() or "video.mp4"
+            self.send_response(200)
+            self.send_header("Content-Type", _guess_ctype(name))
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition",
+                             f"attachment; filename=\"{ascii_name}\"; "
+                             f"filename*=UTF-8''{quote(name)}")
+            self.end_headers()
+            with open(path, "rb") as fh:
+                shutil.copyfileobj(fh, self.wfile, 256 * 1024)
+        finally:
+            _yt_cleanup(job_id)
+
+    def do_POST(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(length)) if length else {}
+
+            if self.path == "/inspect":
+                files = resolve_files([data.get("file")])
+                self._json(op_inspect(files[0], data.get("thumbs", "cover")))
+                return
+
+            if self.path == "/yt_info":
+                self._json(op_yt_info(data.get("url", "").strip(),
+                                      data.get("cookies", "")))
+                return
+
+            if self.path == "/yt_start":
+                self._json(op_yt_start(data.get("url", ""), data.get("height"),
+                                       data.get("compat", "best"),
+                                       data.get("vertical", "off"),
+                                       data.get("vsize", "1080"),
+                                       data.get("cookies", "")))
+                return
+
+            if self.path == "/qr":
+                payload = data.get("data")
+                if payload is None:
+                    payload = qr_payload(data.get("kind", "text"),
+                                         data.get("fields", {}))
+                self._json(op_qr(
+                    data=payload, ec=data.get("ec", "H"),
+                    target_px=data.get("target_px", 1024),
+                    border=data.get("border", 4), fg=data.get("fg", "#000000"),
+                    bg=data.get("bg", "#ffffff"), style=data.get("style", "square"),
+                    logo_data=data.get("logo_data"),
+                    logo_pct=data.get("logo_pct", 22),
+                    logo_style=data.get("logo_style", "original"),
+                    pad=bool(data.get("pad", True)),
+                    pad_shape=data.get("pad_shape", "rounded"),
+                    pad_pct=data.get("pad_pct", 6),
+                    fmt=data.get("fmt", "png")))
+                return
+
+            if self.path == "/img_fetch":
+                if data.get("url"):
+                    raw, name = op_img_fetch(data["url"])
+                else:
+                    got = resolve_files([data.get("file")])
+                    raw, name = got[0]["bytes"], got[0]["name"]
+                token = cache_put(name, raw)
+                out = img_describe(raw, name)
+                out["token"] = token
+                self._json(out)
+                return
+
+            if self.path == "/merge":
+                files = resolve_files(data.get("files", []))
+                if not files:
+                    raise FeatureError("Add at least one PDF to merge.")
+                results, info = op_merge(files, bool(data.get("bookmarks", True)))
+            elif self.path == "/split":
+                f = data.get("file")
+                if not f:
+                    raise FeatureError("Add a PDF to split.")
+                files = resolve_files([f])
+                results, info = op_split(files[0], data.get("mode", "each"),
+                                         data.get("ranges", ""),
+                                         data.get("every_n", 1),
+                                         data.get("pages"))
+            elif self.path == "/compress":
+                files = resolve_files(data.get("files", []))
+                if not files:
+                    raise FeatureError("Add at least one PDF to compress.")
+                p = COMPRESS_PRESETS.get(data.get("preset"))
+                if p:
+                    results, info = op_compress(files, p["mode"], p["quality"], p["max_px"])
+                else:
+                    results, info = op_compress(files, data.get("mode", "strong"),
+                                                data.get("quality", 60), data.get("max_px", 1600))
+            elif self.path == "/compress_preview":
+                files = resolve_files(data.get("files", []))
+                if not files:
+                    raise FeatureError("Add at least one PDF to compress.")
+                self._json(op_compress_preview(files))
+                return
+            elif self.path == "/download":
+                files = resolve_files(data.get("files", []))
+                results = [(f["name"], f["bytes"]) for f in files]
+                info = data.get("info", "Done.")
+            elif self.path == "/img_process":
+                got = resolve_files([data.get("file")])
+                results, info = op_img_process(
+                    got[0]["bytes"], got[0]["name"], crop=data.get("crop"),
+                    out_w=data.get("out_w"), out_h=data.get("out_h"),
+                    fmt=data.get("fmt", "png"), quality=data.get("quality", 90),
+                    rotate=data.get("rotate", 0), flip=bool(data.get("flip")),
+                    grayscale=bool(data.get("grayscale")))
+            elif self.path == "/convert":
+                route = data.get("route")
+                fn = CONVERT_ROUTES.get(route)
+                if not fn:
+                    raise FeatureError(f"Unknown conversion: {route}")
+                files = resolve_files(data.get("files", []))
+                if not files:
+                    raise FeatureError("Add at least one file.")
+                results, info = fn(files, img_format=data.get("img_format", "png"),
+                                   dpi=data.get("dpi", 150))
+            else:
+                self._raw(404, "Not found")
+                return
+
+            self._deliver(results, info)
+
+        except CacheMiss as cm:
+            self._raw(409, f"cache-miss:{cm}")
+        except FeatureError as fe:
+            self._raw(400, str(fe))
+        except Exception:  # noqa: BLE001
+            self._raw(500, "Server error:\n" + traceback.format_exc())
+
+    def log_message(self, *args):
+        pass
+
+
+def _guess_ctype(name):
+    ext = os.path.splitext(name)[1].lower()
+    return {
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".zip": "application/zip",
+        ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska",
+        ".m4a": "audio/mp4",
+    }.get(ext, "application/octet-stream")
+
+
+def _free_port(preferred=8000):
+    for port in (preferred, 8001, 8080, 0):
+        try:
+            s = socket.socket()
+            s.bind(("127.0.0.1", port))
+            p = s.getsockname()[1]
+            s.close()
+            return p
+        except OSError:
+            continue
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+#  Front-end
+# --------------------------------------------------------------------------- #
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multi Toolkit</title>
+<style>
+  :root{
+    --bg:#101019; --panel:#181826; --panel2:#212134; --line:#32314e;
+    --ink:#ecebf7; --mut:#9b99bd; --acc:#8b7bff; --acc-hi:#a99cff;
+    --ok:#46d6a4; --bad:#ff5e7e; --amber:#ffc66b; --sky:#5ec8ff; --pink:#ff8ad4;
+    --mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box} ::selection{background:#8b7bff55}
+  html{color-scheme:dark}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+    display:flex;justify-content:center;padding:26px 16px 60px;}
+  .wrap{width:100%;max-width:860px}
+
+  /* header */
+  .eyebrow{font:600 11px/1 var(--mono);letter-spacing:.22em;color:var(--acc);margin-bottom:8px}
+  .head{display:flex;align-items:flex-end;gap:14px;flex-wrap:wrap;margin-bottom:18px}
+  h1{font-size:30px;margin:0;letter-spacing:-.02em;font-weight:700}
+  .pills{display:flex;gap:6px;margin-left:auto;flex-wrap:wrap}
+  .pill{font:500 11.5px var(--mono);padding:5px 10px;border-radius:99px;
+    border:1px solid var(--line);color:var(--mut);background:var(--panel)}
+  .pill.on{color:var(--ok);border-color:#46d6a455}
+  .pill.off{color:var(--mut)}
+
+  /* tabs */
+  .tabs{display:flex;gap:4px;background:var(--panel);padding:4px;border-radius:12px;
+    margin-bottom:14px;border:1px solid var(--line)}
+  .tab{flex:1;text-align:center;padding:9px 4px;border-radius:9px;cursor:pointer;
+    color:var(--mut);font-weight:600;font-size:14px;transition:.13s;user-select:none}
+  .tab:hover{color:var(--ink)}
+  .tab.active{background:var(--acc);color:#fff}
+
+  /* drop zone */
+  .drop{border:1.5px dashed var(--line);border-radius:14px;text-align:center;
+    color:var(--mut);cursor:pointer;transition:.15s;margin-bottom:12px;background:var(--panel)}
+  .drop.big{padding:34px 20px}
+  .drop.slim{padding:11px 16px;display:flex;align-items:center;gap:10px;text-align:left;font-size:13.5px}
+  .drop.hot{border-color:var(--acc);color:var(--ink);background:var(--panel2)}
+  .drop b{color:var(--ink)}
+  .drop .hint{display:block;margin-top:7px;font-size:12.5px;opacity:.85}
+  .drop.slim .hint{display:inline;margin:0 0 0 auto}
+
+  /* file list */
+  .files{margin:0 0 12px;padding:0;list-style:none;border-radius:13px;overflow:hidden;
+    background:var(--panel);border:1px solid var(--line)}
+  .files:empty{display:none}
+  .row{display:flex;align-items:center;gap:12px;padding:9px 12px;border-bottom:1px solid var(--line);
+    background:var(--panel);transition:background .12s}
+  .row:last-child{border-bottom:none}
+  .row.dragging{opacity:.35}
+  .row .grip{cursor:grab;color:var(--mut);font-size:15px;padding:4px 2px;user-select:none}
+  .row .grip:active{cursor:grabbing}
+  .thumb{width:38px;height:50px;border-radius:5px;background:var(--panel2);border:1px solid var(--line);
+    object-fit:cover;flex:none;display:flex;align-items:center;justify-content:center;
+    font:600 10px var(--mono);color:var(--mut)}
+  .meta{flex:1;min-width:0}
+  .meta .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
+  .meta .sub{font:11.5px var(--mono);color:var(--mut);margin-top:2px}
+  .row button{font:inherit;border:0;border-radius:7px;padding:5px 8px;cursor:pointer;
+    background:transparent;color:var(--mut);transition:.12s}
+  .row button:hover{background:var(--line);color:var(--ink)}
+  .row button:disabled{opacity:.3;cursor:default}
+  .row .del:hover{background:var(--bad);color:#fff}
+  .row.pickable{cursor:pointer}
+  .row.picked{background:#8b7bff14;box-shadow:inset 3px 0 0 var(--acc)}
+  .row .pickdot{font:600 10.5px var(--mono);color:var(--acc);flex:none;display:none}
+  .row.picked .pickdot{display:block}
+
+  .toolbar{display:flex;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap}
+  .toolbar .sp{flex:1}
+  button.btn{font:inherit;border:1px solid var(--line);border-radius:9px;padding:8px 14px;
+    cursor:pointer;background:var(--panel);color:var(--ink);transition:.13s}
+  button.btn:hover{background:var(--panel2)}
+  button.btn.danger{color:var(--bad)} button.btn.danger:hover{background:var(--bad);color:#fff;border-color:var(--bad)}
+  button.primary{font:600 15px/1 inherit;border:0;border-radius:10px;padding:13px 26px;
+    cursor:pointer;background:var(--acc);color:#fff;transition:.13s}
+  button.primary:hover{background:var(--acc-hi)}
+  button.primary:disabled{opacity:.4;cursor:not-allowed}
+
+  /* option panels */
+  .opts{background:var(--panel);border:1px solid var(--line);border-radius:13px;
+    padding:13px 15px;margin-bottom:12px;display:flex;flex-wrap:wrap;gap:12px 22px;align-items:center}
+  .opts label{font-size:13.5px;color:var(--mut);display:flex;align-items:center;gap:8px}
+  .opts input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
+  .opts input[type=text],.opts input[type=number],.opts select{background:var(--panel2);
+    color:var(--ink);border:1px solid var(--line);border-radius:7px;padding:7px 9px;font:inherit}
+  .opts input[type=range]{accent-color:var(--acc)}
+  .hide{display:none!important}
+
+  /* split preview */
+  .chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+  .chip{font:600 12.5px var(--mono);padding:7px 12px;border-radius:99px;cursor:pointer;
+    border:1px solid var(--line);color:var(--mut);background:var(--panel);transition:.13s;user-select:none}
+  .chip:hover{color:var(--ink)}
+  .chip.active{background:var(--acc);border-color:var(--acc);color:#fff}
+  .preview{background:var(--panel);border:1px solid var(--line);border-radius:13px;
+    padding:14px;margin-bottom:12px}
+  .pv-head{display:flex;align-items:baseline;gap:10px;margin-bottom:10px;flex-wrap:wrap}
+  .pv-title{font-weight:600;font-size:14px}
+  .pv-sum{font:12.5px var(--mono);color:var(--acc);margin-left:auto}
+  .pv-note{font-size:12.5px;color:var(--mut);margin-bottom:10px}
+  .grid{display:flex;flex-wrap:wrap;align-items:stretch;gap:8px 0;max-height:480px;
+    overflow-y:auto;padding:4px 2px}
+  .pg{width:92px;flex:none;border-radius:8px;padding:5px 5px 4px;cursor:default;
+    border:2px solid transparent;transition:border-color .12s, opacity .12s;text-align:center}
+  .pg img{width:100%;border-radius:4px;display:block;background:#fff}
+  .pg .ph{width:100%;aspect-ratio:3/4;border-radius:4px;background:var(--panel2);
+    display:flex;align-items:center;justify-content:center;font:600 15px var(--mono);color:var(--mut)}
+  .pg .lbl{font:11px var(--mono);color:var(--mut);margin-top:4px}
+  .pg.selectable{cursor:pointer}
+  .pg.dim{opacity:.32}
+  .pg.sel{border-color:var(--ok)}
+  .cut{width:20px;flex:none;display:flex;align-items:center;justify-content:center;
+    position:relative}
+  .cut .ln{width:0;height:84%;border-left:2px dashed var(--line);transition:.12s}
+  .cut.boundary .ln{border-left:2px solid var(--mut)}
+  .cut.clickable{cursor:pointer}
+  .cut.clickable:hover .ln{border-left:2px dashed var(--acc-hi)}
+  .cut.on .ln{border-left:2px solid var(--acc)}
+  .cut .sc{position:absolute;top:-4px;font-size:13px;display:none;transform:rotate(-90deg)}
+  .cut.on .sc{display:block}
+
+  /* compress presets */
+  .presets{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));
+    gap:8px;margin-bottom:12px}
+  .pcard{background:var(--panel);border:1.5px solid var(--line);border-radius:12px;
+    padding:12px 13px;cursor:pointer;transition:.13s}
+  .pcard:hover{background:var(--panel2)}
+  .pcard.active{border-color:var(--acc);background:#8b7bff12}
+  .pcard .t{font-weight:600;font-size:14px}
+  .pcard .d{font-size:12px;color:var(--mut);margin:3px 0 9px;line-height:1.4}
+  .pcard .sz{font:600 12px var(--mono);color:var(--ok);min-height:15px}
+  .pcard .sz.wait{color:var(--mut);font-weight:400}
+  .pg .rm{position:absolute;top:2px;right:2px;width:18px;height:18px;border-radius:50%;
+    background:#000a;color:var(--bad);font:600 11px/18px var(--mono);text-align:center;
+    cursor:pointer;display:none}
+  .pg{position:relative}
+  .pg.reorderable{cursor:grab}
+  .pg.reorderable:hover .rm{display:block}
+  .pg.dragging{opacity:.35}
+
+  /* youtube tab */
+  .ytbox{background:var(--panel);border:1px solid var(--line);border-radius:13px;
+    padding:14px 15px;margin-bottom:12px;display:flex;flex-direction:column;gap:12px}
+  .ytrow{display:flex;gap:8px}
+  .ytrow input{flex:1;background:var(--panel2);color:var(--ink);border:1px solid var(--line);
+    border-radius:8px;padding:10px 12px;font:inherit;min-width:0}
+  .ytrow input:focus{outline:none;border-color:var(--acc)}
+  .ytcard{display:flex;gap:14px;align-items:flex-start}
+  .ytcard img{width:168px;max-width:38%;border-radius:9px;border:1px solid var(--line);
+    background:var(--panel2);flex:none}
+  .ytmeta{flex:1;min-width:0;display:flex;flex-direction:column;gap:6px}
+  .yttitle{font-weight:600;line-height:1.35}
+  .ytsub{font:12px var(--mono);color:var(--mut)}
+  .ytmeta label{font-size:13.5px;color:var(--mut);display:flex;align-items:center;gap:8px;margin-top:4px}
+  .ytsel{display:flex;flex-direction:column;gap:4px;margin-top:4px}
+  .ytsel select{max-width:100%;min-width:0}
+  .ytmeta select{background:var(--panel2);color:var(--ink);border:1px solid var(--line);
+    border-radius:7px;padding:7px 9px;font:inherit}
+  .ytnote{font-size:12px;color:var(--mut)}
+  .ytnote.warn2{color:var(--amber)}
+  @media (max-width:560px){.ytcard{flex-direction:column}.ytcard img{max-width:100%;width:100%}}
+
+  /* progress + status */
+  .bar{height:5px;border-radius:6px;background:var(--panel2);overflow:hidden;margin-bottom:12px;display:none}
+  .bar.show{display:block}
+  .bar i{display:block;height:100%;width:40%;background:var(--acc);border-radius:6px;
+    animation:slide 1s linear infinite}
+  @keyframes slide{0%{margin-left:-40%}100%{margin-left:100%}}
+  .status{background:var(--panel);border:1px solid var(--line);border-radius:11px;
+    padding:11px 14px;font:12.5px/1.55 var(--mono);color:var(--mut);min-height:20px;white-space:pre-wrap}
+  .status.ok{color:var(--ok)} .status.err{color:var(--bad)}
+  .warn{color:var(--amber);font-size:13px;margin-bottom:10px;display:none}
+
+  /* toasts */
+  .toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:50}
+  .toast{background:var(--panel2);border:1px solid var(--line);color:var(--ink);
+    padding:10px 14px;border-radius:10px;font-size:13.5px;box-shadow:0 6px 24px #0008;
+    animation:pop .18s ease-out}
+  .toast.ok{border-color:#46d6a455} .toast.err{border-color:#ff5e7e66}
+  @keyframes pop{from{transform:translateY(8px);opacity:0}to{transform:none;opacity:1}}
+  @media (prefers-reduced-motion: reduce){
+    *{animation:none!important;transition:none!important}
+  }
+  @media (max-width:560px){
+    .pg{width:76px} h1{font-size:24px}
+  }
+
+  /* group nav */
+  .groups{display:flex;gap:8px;margin-bottom:10px}
+  .group{flex:1;display:flex;flex-direction:column;gap:2px;padding:10px 14px;
+    border-radius:12px;border:1.5px solid var(--line);background:var(--panel);
+    cursor:pointer;transition:.13s;user-select:none}
+  .group:hover{background:var(--panel2)}
+  .group.active{border-color:var(--acc);background:#8b7bff12}
+  .group b{font-size:14.5px}
+  .group span{font:11px var(--mono);color:var(--mut);letter-spacing:.02em}
+  .group.active span{color:var(--acc-hi)}
+
+  /* generic card */
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:13px;
+    padding:14px 15px;margin-bottom:12px}
+  .card h4{margin:0 0 10px;font-size:12px;font-family:var(--mono);font-weight:600;
+    letter-spacing:.14em;text-transform:uppercase;color:var(--mut)}
+
+  /* QR */
+  .qrgrid{display:grid;grid-template-columns:1fr 292px;gap:12px;align-items:start}
+  @media (max-width:720px){.qrgrid{grid-template-columns:1fr}}
+  .qrfields{display:flex;flex-direction:column;gap:9px}
+  .fld{display:flex;flex-direction:column;gap:4px}
+  .fld>span{font:11px var(--mono);color:var(--mut);letter-spacing:.08em;text-transform:uppercase}
+  .fld input[type=text],.fld textarea,.fld select{background:var(--panel2);color:var(--ink);
+    border:1px solid var(--line);border-radius:8px;padding:9px 11px;font:inherit;width:100%}
+  .fld input:focus,.fld textarea:focus{outline:none;border-color:var(--acc)}
+  .fld textarea{min-height:76px;resize:vertical}
+  .fld.check{flex-direction:row;align-items:center;gap:9px}
+  .fld.check>span{text-transform:none;letter-spacing:0;font-size:13.5px;
+    font-family:inherit;color:var(--mut)}
+  .qrstage{position:sticky;top:16px;display:flex;flex-direction:column;gap:9px}
+  .sheet{width:100%;aspect-ratio:1;border-radius:12px;border:1px solid var(--line);
+    display:flex;align-items:center;justify-content:center;overflow:hidden;
+    background-color:#fff;background-size:18px 18px;background-position:0 0,9px 9px;
+    background-image:linear-gradient(45deg,#e6e6f0 25%,transparent 25%,transparent 75%,#e6e6f0 75%),
+      linear-gradient(45deg,#e6e6f0 25%,transparent 25%,transparent 75%,#e6e6f0 75%)}
+  .sheet img{width:100%;height:100%;object-fit:contain;display:block}
+  .sheet .empty{color:#8a88a8;font:12.5px var(--mono);padding:16px;text-align:center}
+  .qrstat{font:11.5px/1.5 var(--mono);color:var(--mut);text-align:center}
+  .qrwarn{font-size:12.5px;line-height:1.5;color:var(--amber)}
+  .swatch{width:100%;height:32px;padding:0;border:1px solid var(--line);
+    border-radius:7px;background:none;cursor:pointer}
+  .logodrop{border:1.5px dashed var(--line);border-radius:11px;padding:14px;
+    text-align:center;color:var(--mut);cursor:pointer;font-size:13px;transition:.13s}
+  .logodrop:hover{border-color:var(--acc);color:var(--ink)}
+  .logodrop.hot{border-color:var(--acc);background:var(--panel2);color:var(--ink)}
+  .logochip{display:flex;align-items:center;gap:11px}
+  .logochip img{width:46px;height:46px;object-fit:contain;border-radius:8px;
+    background:#fff;border:1px solid var(--line);flex:none}
+  .logochip .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap;font-size:13.5px}
+
+  /* image crop */
+  .cropwrap{position:relative;margin:0 auto 12px;line-height:0;width:max-content;
+    max-width:100%;border-radius:12px;overflow:hidden;background:var(--panel2);
+    touch-action:none;user-select:none}
+  .cropwrap img{max-width:100%;display:block;-webkit-user-drag:none}
+  .cropbox{position:absolute;border:1.5px solid #fff;box-sizing:border-box;
+    box-shadow:0 0 0 9999px rgba(8,8,16,.60);cursor:move}
+  .cropbox .h{position:absolute;width:14px;height:14px;background:#fff;
+    border:1px solid #00000055;border-radius:3px}
+  .cropbox .nw{left:-8px;top:-8px;cursor:nwse-resize}
+  .cropbox .ne{right:-8px;top:-8px;cursor:nesw-resize}
+  .cropbox .sw{left:-8px;bottom:-8px;cursor:nesw-resize}
+  .cropbox .se{right:-8px;bottom:-8px;cursor:nwse-resize}
+  .rng{display:flex;align-items:center;gap:8px}
+  .rng input[type=range]{width:120px}
+  .rng b{font:600 12px var(--mono);color:var(--acc);min-width:38px}
+</style></head>
+<body><div class="wrap">
+  <div class="eyebrow">LOCAL WORKBENCH</div>
+  <div class="head">
+    <h1>Multi Toolkit</h1>
+    <div class="pills">
+      <span class="pill on">127.0.0.1 only</span>
+      <span class="pill off" id="pillLO">LibreOffice …</span>
+      <span class="pill off" id="pillGS">Ghostscript …</span>
+      <span class="pill off" id="pillFF">ffmpeg …</span>
+    </div>
+  </div>
+
+  <div class="groups">
+    <div class="group active" data-g="pdf">
+      <b>PDF</b><span>merge · split · compress · convert</span>
+    </div>
+    <div class="group" data-g="media">
+      <b>Photo &amp; Video</b><span>youtube · reels · images · qr</span>
+    </div>
+  </div>
+
+  <div class="tabs" data-group="pdf">
+    <div class="tab active" data-tab="merge">Merge</div>
+    <div class="tab" data-tab="split">Split</div>
+    <div class="tab" data-tab="compress">Compress</div>
+    <div class="tab" data-tab="convert">Convert</div>
+  </div>
+  <div class="tabs hide" data-group="media">
+    <div class="tab" data-tab="youtube">YouTube</div>
+    <div class="tab" data-tab="reels">Reels</div>
+    <div class="tab" data-tab="image">Image</div>
+    <div class="tab" data-tab="qr">QR Code</div>
+  </div>
+
+  <div class="warn" id="warn"></div>
+
+  <div class="drop big" id="drop">
+    <span id="dropMain"><b>Drop files here</b> or <b>click to choose</b></span>
+    <span class="hint" id="dropHint">Select several at once — Shift-click, Ctrl/Cmd-click, or drag a whole batch in.</span>
+    <input type="file" id="file" multiple hidden>
+  </div>
+
+  <ul class="files" id="list"></ul>
+
+  <div class="toolbar" id="listTools" style="display:none">
+    <button class="btn" id="add">＋ Add more</button>
+    <span class="sp"></span>
+    <button class="btn danger" id="clear">Clear all</button>
+  </div>
+
+  <!-- SPLIT preview -->
+  <div id="splitUI" class="hide">
+    <div class="chips" id="splitChips">
+      <span class="chip active" data-m="cuts">✂ Cut points</span>
+      <span class="chip" data-m="extract">Extract pages</span>
+      <span class="chip" data-m="reorder">Reorder</span>
+      <span class="chip" data-m="each">Every page</span>
+      <span class="chip" data-m="every">Every N</span>
+      <span class="chip" data-m="ranges">Ranges</span>
+    </div>
+    <div class="opts" id="splitOpts">
+      <label id="everyWrap" class="hide">N <input type="number" id="everyN" value="2" min="1" style="width:64px"></label>
+      <label id="rangesWrap" class="hide">Ranges <input type="text" id="ranges" placeholder="1-3,4,5-8" size="16"></label>
+      <button class="btn hide" id="resetOrder" style="padding:6px 12px;font-size:13px">Reset order</button>
+      <span id="splitTip" style="font-size:12.5px;color:var(--mut)"></span>
+    </div>
+    <div class="preview" id="preview">
+      <div class="pv-head">
+        <span class="pv-title" id="pvTitle">Pages</span>
+        <span class="pv-sum" id="pvSum"></span>
+      </div>
+      <div class="pv-note" id="pvNote"></div>
+      <div class="grid" id="grid"></div>
+    </div>
+  </div>
+
+  <!-- option panels -->
+  <div class="opts" id="opt-merge">
+    <label><input type="checkbox" id="bm" checked> Add a bookmark for each source file</label>
+  </div>
+
+  <div id="compressUI" class="hide">
+    <div class="presets">
+      <div class="pcard" data-p="high">
+        <div class="t">High compression</div>
+        <div class="d">Smallest file. Images downscaled hard — fine for email &amp; archiving.</div>
+        <div class="sz" id="sz-high">—</div>
+      </div>
+      <div class="pcard active" data-p="balanced">
+        <div class="t">Balanced</div>
+        <div class="d">Good size cut with little visible loss. The sane default.</div>
+        <div class="sz" id="sz-balanced">—</div>
+      </div>
+      <div class="pcard" data-p="quality">
+        <div class="t">High quality</div>
+        <div class="d">Light touch on images — for print or figure-heavy papers.</div>
+        <div class="sz" id="sz-quality">—</div>
+      </div>
+      <div class="pcard" data-p="lossless">
+        <div class="t">Lossless</div>
+        <div class="d">Structure cleanup only. Pixels untouched, guaranteed.</div>
+        <div class="sz" id="sz-lossless">—</div>
+      </div>
+    </div>
+    <div id="compNote" style="font-size:12.5px;color:var(--amber);margin:-4px 2px 12px;display:none"></div>
+  </div>
+
+  <div class="opts hide" id="opt-convert">
+    <label>Conversion
+      <select id="route">
+        <option value="office2pdf">Office → PDF (Word / PowerPoint / Excel)</option>
+        <option value="pdf2docx">PDF → Word (.docx)</option>
+        <option value="pdf2pptx">PDF → PowerPoint (.pptx)</option>
+        <option value="pdf2img">PDF → Images (PNG / JPG)</option>
+        <option value="img2pdf">Images → PDF</option>
+      </select>
+    </label>
+    <label id="imgFmtWrap" class="hide">Format
+      <select id="imgFormat"><option value="png">PNG</option><option value="jpg">JPG</option></select>
+    </label>
+    <label id="dpiWrap" class="hide">DPI <input type="number" id="dpi" value="150" min="72" step="10" style="width:74px"></label>
+  </div>
+
+  <!-- YOUTUBE -->
+  <div id="ytUI" class="hide">
+    <div class="ytbox">
+      <div class="ytrow">
+        <input type="text" id="ytUrl" placeholder="https://www.youtube.com/watch?v=…"
+               autocomplete="off" spellcheck="false">
+        <button class="btn" id="ytFetch">Fetch info</button>
+      </div>
+      <div id="ytCard" class="ytcard hide">
+        <img id="ytThumb" alt="">
+        <div class="ytmeta">
+          <div class="yttitle" id="ytTitle"></div>
+          <div class="ytsub" id="ytSub"></div>
+          <div class="ytsel">
+            <label>Resolution <select id="ytRes"></select></label>
+            <label id="ytFmtWrap">Format <select id="ytFmt">
+              <option value="qt">QuickTime mp4 — max res, converted (HEVC/H.264)</option>
+              <option value="best">Original codec — max quality (VP9/AV1, use VLC/IINA)</option>
+              <option value="h264">Native H.264 mp4 — plays anywhere, ≤1080p</option>
+            </select></label>
+          </div>
+        </div>
+      </div>
+      <div class="opts" id="ytExtra" style="margin:0">
+        <label id="ytVertWrap">Vertical 9:16
+          <select id="ytVert">
+            <option value="off">Keep original framing</option>
+            <option value="blur">Blurred backdrop (nothing cropped)</option>
+            <option value="crop">Crop to fill</option>
+            <option value="pad">Black bars</option>
+          </select>
+        </label>
+        <label id="ytSizeWrap" class="hide">Canvas
+          <select id="ytVSize">
+            <option value="1080">1080 × 1920 · Reels / Shorts / TikTok</option>
+            <option value="720">720 × 1280 · lighter file</option>
+            <option value="1350">1080 × 1350 · Instagram feed 4:5</option>
+          </select>
+        </label>
+        <label>Sign-in cookies
+          <select id="ytCookies">
+            <option value="">None (public posts only)</option>
+            <option value="chrome">Chrome</option>
+            <option value="firefox">Firefox</option>
+            <option value="safari">Safari</option>
+            <option value="edge">Edge</option>
+            <option value="brave">Brave</option>
+            <option value="chromium">Chromium</option>
+          </select>
+        </label>
+      </div>
+      <div class="ytnote" id="ytNote">Only download videos you own or have permission to save.</div>
+    </div>
+  </div>
+
+  <!-- IMAGE -->
+  <div id="imgUI" class="hide">
+    <div class="ytbox">
+      <div class="ytrow">
+        <input type="text" id="imgUrl" placeholder="https://…/photo.jpg  (direct link to the image)"
+               autocomplete="off" spellcheck="false">
+        <button class="btn" id="imgFetch">Load</button>
+      </div>
+      <div class="logodrop" id="imgDrop">…or <b>drop an image here</b> / click to choose
+        <input type="file" id="imgFile" accept="image/*" hidden></div>
+    </div>
+
+    <div id="imgEditor" class="hide">
+      <div class="card">
+        <h4>Crop</h4>
+        <div class="cropwrap" id="cropWrap">
+          <img id="imgPrev" alt="">
+          <div class="cropbox" id="cropBox">
+            <span class="h nw"></span><span class="h ne"></span>
+            <span class="h sw"></span><span class="h se"></span>
+          </div>
+        </div>
+        <div class="chips" id="arChips" style="margin-bottom:0">
+          <span class="chip active" data-ar="free">Free</span>
+          <span class="chip" data-ar="1">1:1</span>
+          <span class="chip" data-ar="0.8">4:5</span>
+          <span class="chip" data-ar="0.5625">9:16</span>
+          <span class="chip" data-ar="1.7777778">16:9</span>
+          <span class="chip" data-ar="1.5">3:2</span>
+          <span class="chip" data-ar="orig">Original</span>
+          <span class="chip" data-ar="full">Whole image</span>
+        </div>
+      </div>
+
+      <div class="opts">
+        <label>Width <input type="number" id="outW" min="1" step="1" style="width:92px"></label>
+        <label>Height <input type="number" id="outH" min="1" step="1" style="width:92px"></label>
+        <label>Format
+          <select id="imgFmt">
+            <option value="png">PNG — lossless</option>
+            <option value="jpg">JPG — small</option>
+            <option value="webp">WebP — smallest</option>
+          </select>
+        </label>
+        <label id="imgQWrap" class="hide rng">Quality
+          <input type="range" id="imgQ" min="40" max="100" value="90"><b id="imgQVal">90</b>
+        </label>
+        <label><input type="checkbox" id="imgGray"> Grayscale</label>
+        <button class="btn" id="imgRot" style="padding:6px 12px;font-size:13px">Rotate 90°</button>
+        <button class="btn" id="imgFlip" style="padding:6px 12px;font-size:13px">Flip</button>
+        <button class="btn" id="cropReset" style="padding:6px 12px;font-size:13px">Reset</button>
+      </div>
+      <div class="ytnote" id="imgInfo"></div>
+    </div>
+  </div>
+
+  <!-- QR CODE -->
+  <div id="qrUI" class="hide">
+    <div class="qrgrid">
+      <div>
+        <div class="card">
+          <h4>What should it hold?</h4>
+          <div class="chips" id="qrKinds">
+            <span class="chip active" data-k="url">Link</span>
+            <span class="chip" data-k="text">Text</span>
+            <span class="chip" data-k="wifi">Wi-Fi</span>
+            <span class="chip" data-k="email">Email</span>
+            <span class="chip" data-k="sms">SMS</span>
+            <span class="chip" data-k="phone">Phone</span>
+            <span class="chip" data-k="vcard">Contact</span>
+            <span class="chip" data-k="geo">Location</span>
+          </div>
+          <div class="qrfields" id="qrFields"></div>
+        </div>
+
+        <div class="card">
+          <h4>Centre logo</h4>
+          <div class="logodrop" id="qrLogoDrop">
+            <b>Drop a logo</b> or click to choose — PNG with a transparent
+            background works best
+            <input type="file" id="qrLogoFile" accept="image/*" hidden>
+          </div>
+          <div class="logochip hide" id="qrLogoChip" style="margin-top:11px">
+            <img id="qrLogoThumb" alt="">
+            <span class="nm" id="qrLogoName"></span>
+            <button class="btn danger" id="qrLogoClear"
+                    style="padding:5px 11px;font-size:13px">Remove</button>
+          </div>
+          <div class="opts hide" id="qrLogoOpts" style="margin:11px 0 0">
+            <label class="rng">Size
+              <input type="range" id="qrLogoPct" min="8" max="34" value="22">
+              <b id="qrLogoPctVal">22%</b>
+            </label>
+            <label>Look
+              <select id="qrLogoStyle">
+                <option value="original">Original colours</option>
+                <option value="silhouette">Silhouette — matches the code</option>
+              </select>
+            </label>
+            <label><input type="checkbox" id="qrPad"> Backing plate</label>
+            <label id="qrPadShapeWrap" class="hide">Shape
+              <select id="qrPadShape">
+                <option value="rounded">Rounded</option>
+                <option value="circle">Circle</option>
+                <option value="square">Square</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div class="card">
+          <h4>Style</h4>
+          <div class="opts" style="margin:0;padding:0;border:0;background:none">
+            <label>Modules
+              <select id="qrStyle">
+                <option value="square">Square</option>
+                <option value="dots">Dots</option>
+                <option value="rounded">Rounded</option>
+              </select>
+            </label>
+            <label>Foreground <input type="color" id="qrFg" value="#000000" class="swatch"
+                                    style="width:44px"></label>
+            <label>Background <input type="color" id="qrBg" value="#ffffff" class="swatch"
+                                    style="width:44px"></label>
+            <label><input type="checkbox" id="qrTransparent"> Transparent</label>
+            <label>Error correction
+              <select id="qrEc">
+                <option value="L">L — 7%</option>
+                <option value="M">M — 15%</option>
+                <option value="Q">Q — 25%</option>
+                <option value="H" selected>H — 30% (needed for logos)</option>
+              </select>
+            </label>
+            <label>Size
+              <select id="qrSize">
+                <option value="512">512 px</option>
+                <option value="1024" selected>1024 px</option>
+                <option value="2048">2048 px — print</option>
+                <option value="4096">4096 px — poster</option>
+              </select>
+            </label>
+            <label>Quiet zone
+              <input type="number" id="qrBorder" value="4" min="0" max="16" style="width:64px">
+            </label>
+            <label>File
+              <select id="qrFmt"><option value="png">PNG</option><option value="jpg">JPG</option></select>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <div class="qrstage">
+        <div class="sheet" id="qrSheet">
+          <span class="empty" id="qrEmpty">Your code appears here as you type</span>
+          <img id="qrImg" alt="QR preview" style="display:none">
+        </div>
+        <div class="qrstat" id="qrStat"></div>
+        <div class="qrwarn" id="qrWarn"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="bar" id="bar"><i></i></div>
+
+  <div class="toolbar">
+    <span class="sp"></span>
+    <button class="primary" id="go">Merge &amp; Download</button>
+  </div>
+
+  <div class="status" id="status">Ready — add some files.</div>
+</div>
+<div class="toasts" id="toasts"></div>
+
+<script>
+const $=id=>document.getElementById(id);
+const GC=['#8b7bff','#46d6a4','#ffc66b','#5ec8ff','#ff8ad4'];
+let files=[];                 // {id,name,size,b64,kind,token,pages,cover,thumbs}
+let tab='merge';
+let splitId=null;             // file id previewed in Split
+let splitMode='cuts';
+let cuts=new Set();           // cut AFTER page p
+let sel=new Set();            // selected pages (extract)
+let order=null;               // page order for Reorder mode
+let compPreset='balanced';
+let compPrev=null;            // {sig, data} from /compress_preview
+let ytInfo=null, ytJob=null, ytPoll=null, ytBusy=false;
+let qrLogo=null, qrKind='url', qrResult=null, qrSeq=0, qrTimer=null;
+let imgState={token:null,name:'',w:0,h:0,crop:null,ar:null,rotate:0,flip:false,
+              url:'',b64:null};
+const PDF_TABS=['merge','split','compress','convert'];
+const VIDEO_TABS=['youtube','reels'];
+const GROUP_OF={merge:'pdf',split:'pdf',compress:'pdf',convert:'pdf',
+  youtube:'media',reels:'media',image:'media',qr:'media'};
+const GO_LABEL={merge:'Merge & Download',split:'Split & Download',
+  compress:'Compress & Download',convert:'Convert & Download',
+  youtube:'Download Video',reels:'Download Reel',image:'Export Image',
+  qr:'Download QR Code'};
+const lastTab={pdf:'merge',media:'youtube'};
+let caps={libreoffice:false, ghostscript:false, ffmpeg:false};
+let nextId=1;
+
+const ACCEPT={
+  merge:'.pdf,application/pdf', split:'.pdf,application/pdf', compress:'.pdf,application/pdf',
+  office2pdf:'.doc,.docx,.ppt,.pptx,.xls,.xlsx,.odt,.odp,.ods,.rtf',
+  pdf2docx:'.pdf', pdf2pptx:'.pdf', pdf2img:'.pdf',
+  img2pdf:'.png,.jpg,.jpeg,.bmp,.gif,.tif,.tiff,.webp,image/*'
+};
+const IMG_EXT={png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',gif:'image/gif',
+  bmp:'image/bmp',webp:'image/webp',tif:'image/tiff',tiff:'image/tiff'};
+
+function human(n){const u=['B','KB','MB','GB'];let i=0;while(n>=1024&&i<3){n/=1024;i++;}
+  return (i===0?n:n.toFixed(1))+' '+u[i];}
+function status(m,c){const s=$('status');s.textContent=m;s.className='status'+(c?' '+c:'');}
+function toast(m,c){const t=document.createElement('div');t.className='toast'+(c?' '+c:'');
+  t.textContent=m;$('toasts').appendChild(t);setTimeout(()=>t.remove(),3200);}
+function kindOf(name){const e=name.split('.').pop().toLowerCase();
+  if(e==='pdf')return 'pdf'; if(IMG_EXT[e])return 'img'; return 'other';}
+function currentRoute(){ return tab==='convert' ? $('route').value : tab; }
+function fref(f,full){ return (!full && f.token) ? {token:f.token,name:f.name}
+                                                 : {name:f.name,data:f.b64}; }
+
+/* ---------- adding files ---------- */
+function bufToB64(buf){let bin='';const b=new Uint8Array(buf),c=0x8000;
+  for(let i=0;i<b.length;i+=c)bin+=String.fromCharCode.apply(null,b.subarray(i,i+c));
+  return btoa(bin);}
+
+async function addFiles(fl){
+  let added=0;
+  for(const file of [...fl]){
+    if(files.some(f=>f.name===file.name && f.size===file.size)) continue;
+    const buf=await file.arrayBuffer();
+    const f={id:nextId++,name:file.name,size:file.size,b64:bufToB64(buf),
+             kind:kindOf(file.name),token:null,pages:null,cover:null,thumbs:null};
+    files.push(f); added++;
+    if(f.kind==='pdf') inspectCover(f);          // async: token + pages + cover
+  }
+  if(added && tab==='split' && splitId===null){
+    const p=files.find(f=>f.kind==='pdf'); if(p){splitId=p.id; resetSplitState();}
+  }
+  render();
+  if(added){toast(`Added ${added} file${added>1?'s':''}`,'ok');
+    if(tab==='compress')refreshCompressPreview();}
+  else toast('Duplicates skipped');
+}
+
+async function inspectCover(f){
+  try{
+    const res=await fetch('/inspect',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({file:{name:f.name,data:f.b64},thumbs:'cover'})});
+    if(!res.ok) return;
+    const j=await res.json();
+    f.token=j.token; f.pages=j.pages; f.cover=j.cover;
+    render();
+    if(tab==='split' && splitId===f.id) refreshPreview();
+  }catch(e){/* offline-ish failure: ops will still work with raw data */}
+}
+
+async function ensureThumbs(f){
+  if(f.thumbs) return f;
+  let res=await fetch('/inspect',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({file:fref(f,false),thumbs:'all'})});
+  if(res.status===409){
+    f.token=null;
+    res=await fetch('/inspect',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({file:fref(f,true),thumbs:'all'})});
+  }
+  if(!res.ok) throw new Error(await res.text());
+  const j=await res.json();
+  f.token=j.token; f.pages=j.pages; f.thumbs=j.thumbs||[]; f.cover=j.cover||f.cover;
+  return f;
+}
+
+/* ---------- file list ---------- */
+function coverSrc(f){
+  if(f.kind==='pdf'&&f.cover) return 'data:image/jpeg;base64,'+f.cover;
+  if(f.kind==='img'){const e=f.name.split('.').pop().toLowerCase();
+    return 'data:'+(IMG_EXT[e]||'image/png')+';base64,'+f.b64;}
+  return null;
+}
+
+function render(){
+  const list=$('list'); list.innerHTML='';
+  const pickMode = tab==='split';
+  files.forEach((f,i)=>{
+    const li=document.createElement('li');
+    li.className='row'+(pickMode&&f.kind==='pdf'?' pickable':'')
+                 +(pickMode&&f.id===splitId?' picked':'');
+    li.draggable=true; li.dataset.id=f.id;
+    const src=coverSrc(f);
+    const thumb=src?`<img class="thumb" src="${src}" alt="">`
+      :`<span class="thumb">${(f.name.split('.').pop()||'?').toUpperCase().slice(0,4)}</span>`;
+    const pages=f.kind==='pdf' ? (f.pages!=null?` · ${f.pages} pg`:' · …') : '';
+    li.innerHTML=`<span class="grip" title="Drag to reorder">⋮⋮</span>${thumb}
+      <span class="meta"><span class="nm" title="${f.name}">${f.name}</span>
+        <span class="sub">${human(f.size)}${pages}</span></span>
+      <span class="pickdot">PREVIEWING</span>
+      <button data-up="${i}" ${i===0?'disabled':''} title="Move up">↑</button>
+      <button data-down="${i}" ${i===files.length-1?'disabled':''} title="Move down">↓</button>
+      <button class="del" data-del="${i}" title="Remove">✕</button>`;
+    list.appendChild(li);
+  });
+  const has=!!files.length, usesList=PDF_TABS.includes(tab);
+  $('listTools').style.display=(has&&usesList)?'flex':'none';
+  const drop=$('drop');
+  drop.classList.toggle('big',!has); drop.classList.toggle('slim',has);
+  drop.classList.toggle('hide',!usesList); list.classList.toggle('hide',!usesList);
+  if(VIDEO_TABS.includes(tab))   $('go').disabled = !ytInfo||ytBusy;
+  else if(tab==='qr')            $('go').disabled = !qrResult;
+  else if(tab==='image')         $('go').disabled = !imgState.token;
+  else                           $('go').disabled = !has;
+  if(tab==='split') refreshSplitVisibility();
+}
+
+$('list').addEventListener('click',e=>{
+  const t=e.target;
+  if(t.dataset.del!==undefined){
+    const f=files[+t.dataset.del];
+    files.splice(+t.dataset.del,1);
+    if(f.id===splitId){const p=files.find(x=>x.kind==='pdf');
+      splitId=p?p.id:null; resetSplitState();}
+    render(); if(tab==='split') refreshPreview();
+    if(tab==='compress') refreshCompressPreview();
+  }
+  else if(t.dataset.up!==undefined){const i=+t.dataset.up;
+    [files[i-1],files[i]]=[files[i],files[i-1]];render();}
+  else if(t.dataset.down!==undefined){const i=+t.dataset.down;
+    [files[i+1],files[i]]=[files[i],files[i+1]];render();}
+  else if(tab==='split'){
+    const li=e.target.closest('.row'); if(!li) return;
+    const f=files.find(x=>x.id===+li.dataset.id);
+    if(f&&f.kind==='pdf'&&f.id!==splitId){splitId=f.id;resetSplitState();render();refreshPreview();}
+  }
+});
+
+/* drag to reorder */
+let dragEl=null;
+$('list').addEventListener('dragstart',e=>{
+  dragEl=e.target.closest('.row'); if(!dragEl)return;
+  dragEl.classList.add('dragging'); e.dataTransfer.effectAllowed='move';
+});
+$('list').addEventListener('dragover',e=>{
+  e.preventDefault();
+  const over=e.target.closest('.row');
+  if(!over||!dragEl||over===dragEl) return;
+  const r=over.getBoundingClientRect();
+  const before=(e.clientY-r.top)<r.height/2;
+  over.parentNode.insertBefore(dragEl, before?over:over.nextSibling);
+});
+$('list').addEventListener('drop',e=>e.preventDefault());
+$('list').addEventListener('dragend',()=>{
+  if(!dragEl) return;
+  dragEl.classList.remove('dragging'); dragEl=null;
+  const order=[...$('list').children].map(li=>+li.dataset.id);
+  files.sort((a,b)=>order.indexOf(a.id)-order.indexOf(b.id));
+  render();
+});
+
+/* reorder-mode drag within the page grid */
+let pgDrag=null;
+$('grid').addEventListener('dragstart',e=>{
+  if(splitMode!=='reorder')return;
+  pgDrag=e.target.closest('.pg'); if(!pgDrag)return;
+  pgDrag.classList.add('dragging'); e.dataTransfer.effectAllowed='move';
+});
+$('grid').addEventListener('dragover',e=>{
+  if(!pgDrag)return; e.preventDefault();
+  const over=e.target.closest('.pg');
+  if(!over||over===pgDrag)return;
+  const r=over.getBoundingClientRect();
+  const before=(e.clientX-r.left)<r.width/2;
+  over.parentNode.insertBefore(pgDrag, before?over:over.nextSibling);
+});
+$('grid').addEventListener('drop',e=>{if(pgDrag)e.preventDefault();});
+$('grid').addEventListener('dragend',()=>{
+  if(!pgDrag)return;
+  pgDrag.classList.remove('dragging'); pgDrag=null;
+  order=[...$('grid').querySelectorAll('.pg')].map(el=>+el.dataset.p);
+  drawGrid();
+});
+$('resetOrder').onclick=()=>{order=null;drawGrid();};
+
+$('add').onclick=()=>$('file').click();
+$('drop').onclick=()=>$('file').click();
+$('file').onchange=e=>{addFiles([...e.target.files]);e.target.value='';};
+$('clear').onclick=()=>{if(files.length&&confirm('Remove all files?')){
+  files=[];splitId=null;resetSplitState();compPrev=null;render();refreshPreview();
+  refreshCompressPreview();status('Cleared.');}};
+
+['dragenter','dragover'].forEach(ev=>document.body.addEventListener(ev,e=>{
+  e.preventDefault();
+  if([...(e.dataTransfer?.types||[])].includes('Files'))$('drop').classList.add('hot');}));
+['dragleave','drop'].forEach(ev=>document.body.addEventListener(ev,e=>{
+  e.preventDefault();if(ev==='drop'||e.target===document.body)$('drop').classList.remove('hot');}));
+document.body.addEventListener('drop',e=>{
+  if(!PDF_TABS.includes(tab)) return;   // other tabs have their own drop zones
+  if(e.dataTransfer.files.length)addFiles(e.dataTransfer.files);});
+
+/* ---------- tabs ---------- */
+function updateAccept(){ $('file').accept=ACCEPT[currentRoute()]||''; }
+function selectTab(name){
+  tab=name; const g=GROUP_OF[name]; lastTab[g]=name;
+  document.querySelectorAll('.tab').forEach(t=>
+    t.classList.toggle('active',t.dataset.tab===name));
+  document.querySelectorAll('.group').forEach(x=>
+    x.classList.toggle('active',x.dataset.g===g));
+  document.querySelectorAll('.tabs').forEach(x=>
+    x.classList.toggle('hide',x.dataset.group!==g));
+  ['merge','convert'].forEach(t=>$('opt-'+t)&&$('opt-'+t).classList.toggle('hide',t!==name));
+  $('compressUI').classList.toggle('hide',name!=='compress');
+  $('ytUI').classList.toggle('hide',!VIDEO_TABS.includes(name));
+  $('imgUI').classList.toggle('hide',name!=='image');
+  $('qrUI').classList.toggle('hide',name!=='qr');
+  if(name!=='split') $('splitUI').classList.add('hide');
+  $('go').textContent=GO_LABEL[name];
+  if(VIDEO_TABS.includes(name)) applyVideoMode();
+  if(name==='compress') refreshCompressPreview();
+  if(name==='split'&&splitId===null){const p=files.find(f=>f.kind==='pdf');
+    if(p){splitId=p.id;resetSplitState();}}
+  updateAccept(); refreshWarn(); render();
+  if(name==='split') refreshPreview();
+  if(name==='qr') qrRefresh();
+}
+document.querySelectorAll('.tab').forEach(el=>el.onclick=()=>selectTab(el.dataset.tab));
+document.querySelectorAll('.group').forEach(el=>el.onclick=()=>selectTab(lastTab[el.dataset.g]));
+
+/* ---------- split preview ---------- */
+function resetSplitState(){cuts=new Set();sel=new Set();order=null;}
+function refreshSplitVisibility(){
+  $('splitUI').classList.toggle('hide', tab!=='split' || !splitId);
+}
+
+document.querySelectorAll('#splitChips .chip').forEach(c=>c.onclick=()=>{
+  document.querySelectorAll('#splitChips .chip').forEach(x=>x.classList.remove('active'));
+  c.classList.add('active'); splitMode=c.dataset.m;
+  $('everyWrap').classList.toggle('hide',splitMode!=='every');
+  $('rangesWrap').classList.toggle('hide',splitMode!=='ranges');
+  $('resetOrder').classList.toggle('hide',splitMode!=='reorder');
+  drawGrid();
+});
+$('everyN').oninput=drawGrid;
+$('ranges').oninput=drawGrid;
+
+function parseClientRanges(spec,total){
+  const out=[];
+  for(let chunk of String(spec).split(',')){
+    chunk=chunk.trim(); if(!chunk)continue;
+    let a,b;
+    if(chunk.includes('-')){const[x,y]=chunk.split('-');
+      a=x.trim()?parseInt(x):1; b=y.trim()?parseInt(y):total;}
+    else a=b=parseInt(chunk);
+    if(isNaN(a)||isNaN(b))continue;
+    a=Math.max(1,a);b=Math.min(total,b);
+    if(a<=b)out.push([a,b]);
+  }
+  return out;
+}
+
+function groupsFor(total){
+  // returns array: group index per page (0-based), or -1 = not included
+  const g=new Array(total).fill(-1);
+  if(splitMode==='cuts'){
+    let gi=0;
+    for(let p=1;p<=total;p++){g[p-1]=gi; if(cuts.has(p))gi++;}
+  }else if(splitMode==='each'){
+    for(let p=0;p<total;p++)g[p]=p;
+  }else if(splitMode==='every'){
+    const n=Math.max(1,parseInt($('everyN').value)||1);
+    for(let p=0;p<total;p++)g[p]=Math.floor(p/n);
+  }else if(splitMode==='ranges'){
+    parseClientRanges($('ranges').value,total).forEach(([a,b],i)=>{
+      for(let p=a;p<=b;p++)g[p-1]=i;});
+  }else if(splitMode==='extract'){
+    for(const p of sel)g[p-1]=0;
+  }
+  return g;
+}
+
+async function refreshPreview(){
+  refreshSplitVisibility();
+  if(tab!=='split'||!splitId)return;
+  const f=files.find(x=>x.id===splitId);
+  if(!f){refreshSplitVisibility();return;}
+  $('pvTitle').textContent=f.name;
+  if(!f.thumbs){
+    $('grid').innerHTML='<div style="color:var(--mut);font-size:13px;padding:8px">Rendering page previews…</div>';
+    try{await ensureThumbs(f);}catch(err){
+      $('grid').innerHTML='<div style="color:var(--bad);font-size:13px;padding:8px">Could not render previews: '
+        +err.message+'</div>';return;}
+  }
+  drawGrid();
+}
+
+function drawGrid(){
+  const f=files.find(x=>x.id===splitId);
+  if(tab!=='split'||!f||!f.thumbs)return;
+  const total=f.pages||f.thumbs.length;
+  const grid=$('grid');
+  const notes={
+    cuts:'Click between pages to place a ✂ cut. Each tinted group becomes its own PDF.',
+    extract:'Click pages to select them. Selected pages are pulled into one PDF (in order).',
+    reorder:'Drag pages into a new order; hover a page and hit ✕ to remove it. Output is one rebuilt PDF.',
+    each:'Every page becomes its own single-page PDF.',
+    every:'Pages are chunked into groups of N.',
+    ranges:'Type ranges like 1-3,4,5-8. Dimmed pages are left out.'
+  };
+  $('pvNote').textContent=notes[splitMode];
+
+  if(splitMode==='reorder'){
+    if(!order)order=Array.from({length:total},(_,i)=>i+1);
+    grid.innerHTML='';
+    for(const p of order){
+      const card=document.createElement('div');
+      card.className='pg reorderable'; card.draggable=true; card.dataset.p=p;
+      const img=f.thumbs[p-1];
+      card.innerHTML=(img?`<img src="data:image/jpeg;base64,${img}" alt="page ${p}">`
+                         :`<div class="ph">${p}</div>`)
+        +`<div class="lbl">p.${p}</div><span class="rm" title="Remove page">✕</span>`;
+      card.querySelector('.rm').onclick=e=>{e.stopPropagation();
+        order=order.filter(x=>x!==p);drawGrid();};
+      grid.appendChild(card);
+    }
+    const moved=order.some((p,i)=>p!==i+1)||order.length!==total;
+    $('pvSum').textContent=`${order.length} of ${total} pages → 1 PDF`
+      +(moved?'':' (original order)');
+    return;
+  }
+
+  const g=groupsFor(total);
+  grid.innerHTML='';
+  for(let p=1;p<=total;p++){
+    const card=document.createElement('div');
+    const gi=g[p-1];
+    card.className='pg'+(splitMode==='extract'?' selectable':'')
+      +((gi<0)?' dim':'')
+      +((splitMode==='extract'&&sel.has(p))?' sel':'');
+    if(gi>=0&&splitMode!=='extract')card.style.borderColor=GC[gi%GC.length];
+    const img=f.thumbs[p-1];
+    card.innerHTML=(img?`<img src="data:image/jpeg;base64,${img}" alt="page ${p}">`
+                       :`<div class="ph">${p}</div>`)
+      +`<div class="lbl">p.${p}${gi>=0&&splitMode!=='extract'&&splitMode!=='each'?' · G'+(gi+1):''}</div>`;
+    if(splitMode==='extract')card.onclick=()=>{sel.has(p)?sel.delete(p):sel.add(p);drawGrid();};
+    grid.appendChild(card);
+    if(p<total){
+      const cut=document.createElement('div');
+      const isBoundary=(g[p-1]!==g[p]&&g[p-1]>=0&&g[p]>=0);
+      cut.className='cut'+(splitMode==='cuts'?' clickable':'')
+        +(splitMode==='cuts'&&cuts.has(p)?' on':'')
+        +(splitMode!=='cuts'&&isBoundary?' boundary':'');
+      cut.innerHTML='<div class="ln"></div><span class="sc">✂</span>';
+      if(splitMode==='cuts'){
+        cut.title='Cut after page '+p;
+        cut.onclick=()=>{cuts.has(p)?cuts.delete(p):cuts.add(p);drawGrid();};
+      }
+      grid.appendChild(cut);
+    }
+  }
+  // summary
+  let sum='';
+  if(splitMode==='cuts')sum=`${cuts.size} cut${cuts.size===1?'':'s'} → ${cuts.size+1} file${cuts.size?'s':''}`;
+  else if(splitMode==='extract')sum=`${sel.size} page${sel.size===1?'':'s'} selected → 1 PDF`;
+  else if(splitMode==='each')sum=`${total} pages → ${total} files`;
+  else if(splitMode==='every'){const n=Math.max(1,parseInt($('everyN').value)||1);
+    sum=`${total} pages → ${Math.ceil(total/n)} files`;}
+  else if(splitMode==='ranges'){const r=parseClientRanges($('ranges').value,total);
+    sum=`${r.length} range${r.length===1?'':'s'} → ${r.length} file${r.length===1?'':'s'}`;}
+  $('pvSum').textContent=sum;
+}
+
+function cutsToRanges(total){
+  const pts=[...cuts].sort((a,b)=>a-b);
+  const out=[];let start=1;
+  for(const c of pts){out.push(start+'-'+c);start=c+1;}
+  out.push(start+'-'+total);
+  return out.join(',');
+}
+
+/* ---------- compress presets ---------- */
+document.querySelectorAll('.pcard').forEach(c=>c.onclick=()=>{
+  document.querySelectorAll('.pcard').forEach(x=>x.classList.remove('active'));
+  c.classList.add('active'); compPreset=c.dataset.p;
+});
+
+function compSig(){return files.filter(f=>f.kind==='pdf').map(f=>f.id).join(',');}
+
+async function refreshCompressPreview(){
+  if(tab!=='compress')return;
+  const pdfs=files.filter(f=>f.kind==='pdf');
+  const sig=compSig();
+  if(!pdfs.length){compPrev=null;
+    document.querySelectorAll('.pcard .sz').forEach(s=>{s.textContent='\u2014';s.className='sz';});
+    return;}
+  if(compPrev&&compPrev.sig===sig&&compPrev.data){paintSizes();return;}
+  if(compPrev&&compPrev.sig===sig&&compPrev.pending)return;   // already estimating
+  compPrev={sig,pending:true,data:null};
+  document.querySelectorAll('.pcard .sz').forEach(s=>{s.textContent='estimating\u2026';s.className='sz wait';});
+  try{
+    let res=await fetch('/compress_preview',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({files:pdfs.map(f=>fref(f,false))})});
+    if(res.status===409){
+      pdfs.forEach(f=>f.token=null);
+      res=await fetch('/compress_preview',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({files:pdfs.map(f=>fref(f,true))})});
+    }
+    if(!res.ok)throw new Error(await res.text());
+    const data=await res.json();
+    if(compSig()!==sig)return;          // files changed while estimating
+    compPrev={sig,data};
+    paintSizes();
+  }catch(err){
+    compPrev=null;
+    document.querySelectorAll('.pcard .sz').forEach(s=>{
+      s.textContent='preview failed \u2014 download still works';s.className='sz wait';});
+  }
+}
+
+function paintSizes(){
+  if(!compPrev||!compPrev.data)return;
+  const orig=compPrev.data.orig;
+  for(const[k,v]of Object.entries(compPrev.data.presets)){
+    const el=$('sz-'+k); if(!el)continue;
+    const pct=Math.round(100*v.total/Math.max(1,orig));
+    el.textContent=`${human(orig)} \u2192 ${human(v.total)} (${pct}%)`;
+    el.className='sz';
+  }
+  // If every preset lands in the same place, say why instead of looking broken.
+  const pp=compPrev.data.presets;
+  const note=$('compNote');
+  const spread=Math.abs(pp.lossless.total-pp.high.total)/Math.max(1,orig);
+  if(spread<0.05){
+    note.style.display='block';
+    note.textContent='Presets all land within a few percent \u2014 this PDF is mostly text/vector with '
+      +'little raster imagery to recompress.'
+      +(caps.ghostscript?'':' Installing Ghostscript unlocks much stronger whole-file compression '
+        +'(fonts, streams, downsampling): macOS \u201cbrew install ghostscript\u201d, Windows '
+        +'\u201cwinget install ArtifexSoftware.GhostScript\u201d \u2014 then restart this app.');
+  }else{
+    note.style.display='none';
+  }
+}
+
+/* ---------- option toggles ---------- */
+$('route').onchange=()=>{const r=$('route').value;
+  $('imgFmtWrap').classList.toggle('hide',r!=='pdf2img');
+  $('dpiWrap').classList.toggle('hide',!(r==='pdf2img'||r==='pdf2pptx'));
+  updateAccept(); refreshWarn();};
+
+function refreshWarn(){
+  const w=$('warn');
+  if(currentRoute()==='office2pdf' && !caps.libreoffice){
+    w.style.display='block';
+    w.textContent='⚠ LibreOffice not detected — needed for Office → PDF. Install from libreoffice.org/download, then restart this app.';
+  } else { w.style.display='none'; }
+}
+
+/* ---------- run ---------- */
+function payload(full){
+  const route=currentRoute();
+  const refs=files.map(f=>fref(f,full));
+  if(tab==='merge') return {ep:'/merge', body:{files:refs,bookmarks:$('bm').checked}};
+  if(tab==='split'){
+    const f=files.find(x=>x.id===splitId)||files.find(x=>x.kind==='pdf');
+    if(!f) throw new Error('Add a PDF to split.');
+    const total=f.pages||1;
+    const body={file:fref(f,full)};
+    if(splitMode==='cuts'){
+      if(!cuts.size) throw new Error('Place at least one ✂ cut between pages (or pick another mode).');
+      body.mode='ranges'; body.ranges=cutsToRanges(total);
+    }else if(splitMode==='extract'){
+      if(!sel.size) throw new Error('Click some pages to select them first.');
+      body.mode='extract'; body.pages=[...sel];
+    }else if(splitMode==='reorder'){
+      if(!order||!order.length) throw new Error('No pages left \u2014 hit Reset order or restore pages.');
+      body.mode='reorder'; body.pages=order;
+    }else if(splitMode==='every'){body.mode='every'; body.every_n=+$('everyN').value;}
+    else if(splitMode==='ranges'){body.mode='ranges'; body.ranges=$('ranges').value;}
+    else body.mode='each';
+    return {ep:'/split', body};
+  }
+  if(tab==='compress'){
+    // If the preview already compressed everything, just download the cached bytes.
+    if(!full && compPrev && compPrev.data && compPrev.sig===compSig()){
+      const pf=compPrev.data.presets[compPreset];
+      return {ep:'/download', body:{files:pf.files.map(x=>({token:x.token,name:x.name})),
+        info:'Compressed ('+compPreset+'): '+human(compPrev.data.orig)+' \u2192 '+human(pf.total)}};
+    }
+    return {ep:'/compress', body:{files:refs,preset:compPreset}};
+  }
+  if(tab==='image'){
+    if(!imgState.token) throw new Error('Load an image first.');
+    const c=imgState.crop||{x:0,y:0,w:imgState.w,h:imgState.h};
+    return {ep:'/img_process', body:{
+      file:{token:imgState.token,name:imgState.name},
+      crop:{x:Math.round(c.x),y:Math.round(c.y),
+            w:Math.round(c.w),h:Math.round(c.h)},
+      out_w:+$('outW').value||null, out_h:+$('outH').value||null,
+      fmt:$('imgFmt').value, quality:+$('imgQ').value,
+      rotate:imgState.rotate, flip:imgState.flip,
+      grayscale:$('imgGray').checked}};
+  }
+  return {ep:'/convert', body:{files:refs,route,
+      img_format:$('imgFormat').value,dpi:+$('dpi').value}};
+}
+
+async function send(full){
+  const {ep,body}=payload(full);
+  return fetch(ep,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(body)});
+}
+
+/* ---------- youtube ---------- */
+function fmtDur(s){s=Math.round(s||0);const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
+  return (h?h+':'+String(m).padStart(2,'0'):m)+':'+String(x).padStart(2,'0');}
+function fmtEta(s){if(s==null)return'';s=Math.round(s);
+  return s>=60?Math.floor(s/60)+'m '+(s%60)+'s':s+'s';}
+
+async function ytFetchInfo(){
+  const url=$('ytUrl').value.trim();
+  if(!url){toast('Paste a video URL first');return;}
+  ytInfo=null;$('ytCard').classList.add('hide');render();
+  $('ytFetch').disabled=true;$('bar').classList.add('show');status('Fetching video info…');
+  try{
+    const res=await fetch('/yt_info',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
+    if(!res.ok)throw new Error(await res.text());
+    ytInfo=await res.json();
+    $('ytTitle').textContent=ytInfo.title;
+    $('ytSub').textContent=[ytInfo.uploader,ytInfo.duration?fmtDur(ytInfo.duration):'']
+      .filter(Boolean).join(' · ');
+    if(ytInfo.thumbnail){$('ytThumb').src=ytInfo.thumbnail;$('ytThumb').style.display='';}
+    else $('ytThumb').style.display='none';
+    const sel=$('ytRes');sel.innerHTML='';
+    const hs=ytInfo.heights&&ytInfo.heights.length?ytInfo.heights:[null];
+    hs.forEach((h,i)=>{const o=document.createElement('option');
+      o.value=h||'';o.textContent=h?h+'p'+(i===0?'  (max)':''):'Best available';
+      sel.appendChild(o);});
+    const note=$('ytNote');
+    $('ytFmtWrap').classList.toggle('hide',!ytInfo.has_ffmpeg);
+    if(!ytInfo.has_ffmpeg){note.className='ytnote warn2';
+      note.textContent='⚠ ffmpeg not found — YouTube caps single-stream downloads around 720p. '
+        +'Install ffmpeg for full 1080p/4K (macOS “brew install ffmpeg”, Windows '
+        +'“winget install Gyan.FFmpeg”, Linux “apt install ffmpeg”), then restart this app.';
+    }else{note.className='ytnote';
+      note.textContent='YouTube stores >1080p only as VP9/AV1, which QuickTime can\u2019t play \u2014 '
+        +'pick \u201cQuickTime mp4\u201d to auto-convert, or \u201cOriginal codec\u201d if you use VLC/IINA. '
+        +'Only download videos you own or have permission to save.';}
+    $('ytCard').classList.remove('hide');
+    status('Ready — pick a resolution and hit Download Video.','ok');
+  }catch(err){status('Failed: '+err.message,'err');toast('Could not read that URL','err');}
+  finally{$('ytFetch').disabled=false;$('bar').classList.remove('show');render();}
+}
+$('ytFetch').onclick=ytFetchInfo;
+$('ytUrl').addEventListener('keydown',e=>{if(e.key==='Enter')ytFetchInfo();});
+$('ytUrl').addEventListener('input',()=>{   // new URL invalidates old info
+  if(ytInfo){ytInfo=null;$('ytCard').classList.add('hide');render();}
+});
+
+async function ytGo(){
+  if(!ytInfo||ytBusy)return;
+  ytBusy=true;render();$('bar').classList.add('show');status('Starting download…');
+  try{
+    const res=await fetch('/yt_start',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({url:$('ytUrl').value.trim(),height:+$('ytRes').value||null,
+        compat:$('ytFmtWrap').classList.contains('hide')?'best':$('ytFmt').value,
+        vertical:vertMode(), vsize:$('ytVSize').value,
+        cookies:$('ytCookies').value})});
+    if(!res.ok)throw new Error(await res.text());
+    ytJob=(await res.json()).id;
+    ytPoll=setInterval(ytCheck,600);
+  }catch(err){ytDone();status('Failed: '+err.message,'err');toast('Download failed','err');}
+}
+function ytDone(){clearInterval(ytPoll);ytPoll=null;ytJob=null;ytBusy=false;
+  $('bar').classList.remove('show');render();}
+async function ytCheck(){
+  if(!ytJob)return;
+  try{
+    const res=await fetch('/yt_progress?id='+ytJob);
+    if(!res.ok)throw new Error(await res.text());
+    const j=await res.json();
+    if(j.status==='error'){ytDone();
+      status('Failed: '+(j.error||'unknown error'),'err');toast('Download failed','err');return;}
+    if(j.status==='done'){
+      const a=document.createElement('a');a.href='/yt_file?id='+ytJob;
+      a.download=j.name||'video.mp4';document.body.appendChild(a);a.click();a.remove();
+      ytDone();
+      const det=j.detail?('\nActual quality: '+j.detail):'';
+      status('Downloaded: '+(j.name||'video')+det,'ok');
+      toast('Downloaded'+(j.detail?' \u00b7 '+j.detail:''),'ok');return;}
+    let line=(j.msg||'Working')+'…';
+    if(j.pct!=null)line+='  '+j.pct+'%';
+    if(j.speed)line+='  ·  '+human(j.speed)+'/s';
+    if(j.eta!=null)line+='  ·  ETA '+fmtEta(j.eta);
+    if(j.rate)line+='  ·  '+j.rate;
+    status(line);
+  }catch(e){/* transient poll failure — keep trying */}
+}
+
+$('go').onclick=async()=>{
+  if(VIDEO_TABS.includes(tab)){ytGo();return;}
+  if(tab==='qr'){qrDownload();return;}
+  if(tab!=='image' && !files.length) return;
+  $('go').disabled=true; $('bar').classList.add('show'); status('Working…');
+  try{
+    let res=await send(false);
+    if(res.status===409){          // cache expired (server restarted) — resend bytes
+      if(tab==='image'){ await imgReload(); res=await send(false); }
+      else{
+        files.forEach(f=>f.token=null); compPrev=null;
+        files.filter(f=>f.kind==='pdf').forEach(inspectCover);
+        res=await send(true);
+      }
+    }
+    if(!res.ok){throw new Error(await res.text()||('HTTP '+res.status));}
+    const fname=decodeURIComponent(res.headers.get('X-Filename')||'output');
+    const info=decodeURIComponent(res.headers.get('X-Info')||'');
+    const blob=await res.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download=fname;
+    document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);
+    status((info||('Saved '+fname))+'\nDownloaded: '+fname,'ok');
+    toast('Downloaded '+fname,'ok');
+  }catch(err){status('Failed: '+err.message,'err');toast('Failed — see status','err');}
+  finally{$('bar').classList.remove('show');render();}
+};
+
+
+/* ---------- video mode (YouTube vs Reels) ---------- */
+function applyVideoMode(){
+  const reels = tab==='reels';
+  $('ytUrl').placeholder = reels
+    ? 'https://www.instagram.com/reel/…  (also TikTok, Shorts, X)'
+    : 'https://www.youtube.com/watch?v=…';
+  // 9:16 reframing is a Reels concern — it only clutters the YouTube tab.
+  // The select keeps its value so a Reels choice survives a trip to YouTube.
+  $('ytVertWrap').classList.toggle('hide', !reels);
+  if(reels && !$('ytVert').dataset.touched) $('ytVert').value = 'blur';
+  syncVertSize();
+}
+function vertMode(){ return tab==='reels' ? $('ytVert').value : 'off'; }
+function syncVertSize(){
+  $('ytSizeWrap').classList.toggle('hide', vertMode()==='off');
+}
+$('ytVert').onchange=()=>{ $('ytVert').dataset.touched='1'; syncVertSize(); };
+
+/* ---------- QR code ---------- */
+const QR_KINDS={
+  url:  [['text','Link','example.com','text']],
+  text: [['text','Text','Anything you want the code to carry','area']],
+  wifi: [['ssid','Network name (SSID)','MyNetwork','text'],
+         ['password','Password','','text'],
+         ['security','Security','','sel:WPA/WPA2|WEP|nopass/No password'],
+         ['hidden','Hidden network','','check']],
+  email:[['to','To','name@example.com','text'],
+         ['subject','Subject','','text'],
+         ['body','Message','','area']],
+  sms:  [['phone','Phone number','+1 555 0100','text'],
+         ['message','Message','','area']],
+  phone:[['phone','Phone number','+1 555 0100','text']],
+  vcard:[['name','Full name','Ada Lovelace','text'],
+         ['org','Organisation','','text'],['title','Job title','','text'],
+         ['phone','Phone','','text'],['email','Email','','text'],
+         ['url','Website','','text']],
+  geo:  [['lat','Latitude','35.7796','text'],['lon','Longitude','-78.6382','text']]
+};
+
+function qrBuildFields(){
+  const box=$('qrFields'); box.innerHTML='';
+  for(const [key,label,ph,type] of QR_KINDS[qrKind]){
+    const w=document.createElement('label');
+    w.className='fld'+(type==='check'?' check':'');
+    const id='qrf_'+key;
+    if(type==='check'){
+      w.innerHTML=`<input type="checkbox" id="${id}"><span>${label}</span>`;
+    }else if(type==='area'){
+      w.innerHTML=`<span>${label}</span><textarea id="${id}" placeholder="${ph}"></textarea>`;
+    }else if(type.startsWith('sel:')){
+      const opts=type.slice(4).split('|').map(o=>{
+        const [v,t]=o.split('/'); return `<option value="${v}">${t||v}</option>`;}).join('');
+      w.innerHTML=`<span>${label}</span><select id="${id}">${opts}</select>`;
+    }else{
+      w.innerHTML=`<span>${label}</span><input type="text" id="${id}" placeholder="${ph}">`;
+    }
+    box.appendChild(w);
+    const el=$(id);
+    el.addEventListener(type==='check'||type.startsWith('sel:')?'change':'input',qrSoon);
+  }
+}
+function qrFieldValues(){
+  const out={};
+  for(const [key,,,type] of QR_KINDS[qrKind]){
+    const el=$('qrf_'+key); if(!el) continue;
+    out[key]= type==='check' ? (el.checked?'1':'') : el.value;
+  }
+  return out;
+}
+document.querySelectorAll('#qrKinds .chip').forEach(c=>c.onclick=()=>{
+  document.querySelectorAll('#qrKinds .chip').forEach(x=>x.classList.remove('active'));
+  c.classList.add('active'); qrKind=c.dataset.k; qrBuildFields(); qrRefresh();
+});
+
+function qrSoon(){ clearTimeout(qrTimer); qrTimer=setTimeout(qrRefresh,260); }
+['qrStyle','qrFg','qrBg','qrTransparent','qrEc','qrSize','qrBorder','qrFmt',
+ 'qrLogoStyle','qrPadShape'].forEach(id=>$(id).addEventListener('change',qrRefresh));
+$('qrBorder').addEventListener('input',qrSoon);
+$('qrLogoPct').addEventListener('input',()=>{
+  $('qrLogoPctVal').textContent=$('qrLogoPct').value+'%'; qrSoon();});
+$('qrPad').addEventListener('change',()=>{
+  $('qrPadShapeWrap').classList.toggle('hide',!$('qrPad').checked); qrRefresh();});
+$('qrTransparent').addEventListener('change',()=>{
+  $('qrBg').disabled=$('qrTransparent').checked;});
+
+/* logo picking */
+function qrSetLogo(file){
+  if(!file) return;
+  if(!/^image\//.test(file.type)){toast('That is not an image','err');return;}
+  const r=new FileReader();
+  r.onload=()=>{
+    qrLogo={name:file.name,data:String(r.result).split(',')[1],url:String(r.result)};
+    $('qrLogoThumb').src=qrLogo.url; $('qrLogoName').textContent=file.name;
+    $('qrLogoChip').classList.remove('hide');
+    $('qrLogoOpts').classList.remove('hide');
+    $('qrLogoDrop').classList.add('hide');
+    if($('qrEc').value!=='H'){ $('qrEc').value='H';
+      toast('Error correction raised to H for the logo'); }
+    qrRefresh();
+  };
+  r.readAsDataURL(file);
+}
+$('qrLogoDrop').onclick=()=>$('qrLogoFile').click();
+$('qrLogoFile').onchange=e=>{qrSetLogo(e.target.files[0]);e.target.value='';};
+['dragenter','dragover'].forEach(ev=>$('qrLogoDrop').addEventListener(ev,e=>{
+  e.preventDefault();e.stopPropagation();$('qrLogoDrop').classList.add('hot');}));
+['dragleave','drop'].forEach(ev=>$('qrLogoDrop').addEventListener(ev,e=>{
+  e.preventDefault();e.stopPropagation();$('qrLogoDrop').classList.remove('hot');}));
+$('qrLogoDrop').addEventListener('drop',e=>qrSetLogo(e.dataTransfer.files[0]));
+$('qrLogoClear').onclick=()=>{
+  qrLogo=null; $('qrLogoChip').classList.add('hide');
+  $('qrLogoOpts').classList.add('hide'); $('qrLogoDrop').classList.remove('hide');
+  qrRefresh();
+};
+
+async function qrRefresh(){
+  if(tab!=='qr') return;
+  const fields=qrFieldValues();
+  const empty=!Object.entries(fields).some(([k,v])=>v&&v.trim());
+  if(empty){
+    qrResult=null; $('qrImg').style.display='none'; $('qrEmpty').style.display='';
+    $('qrStat').textContent=''; $('qrWarn').textContent=''; render(); return;
+  }
+  const seq=++qrSeq;
+  try{
+    const res=await fetch('/qr',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        kind:qrKind, fields,
+        ec:$('qrEc').value, target_px:+$('qrSize').value,
+        border:Math.max(0,Math.min(16,+$('qrBorder').value||0)),
+        fg:$('qrFg').value,
+        bg:$('qrTransparent').checked?'transparent':$('qrBg').value,
+        style:$('qrStyle').value,
+        logo_data:qrLogo?qrLogo.data:null,
+        logo_pct:+$('qrLogoPct').value,
+        logo_style:$('qrLogoStyle').value,
+        pad:$('qrPad').checked, pad_shape:$('qrPadShape').value, pad_pct:8,
+        fmt:$('qrFmt').value})});
+    if(seq!==qrSeq) return;                    // a newer keystroke won
+    if(!res.ok){throw new Error(await res.text());}
+    const j=await res.json();
+    if(seq!==qrSeq) return;
+    qrResult=j;
+    $('qrImg').src='data:'+j.mime+';base64,'+j.image;
+    $('qrImg').style.display=''; $('qrEmpty').style.display='none';
+    $('qrStat').textContent=`v${j.version} · ${j.modules}×${j.modules} modules · `
+      +`EC ${j.ec} · ${j.size}px · ${human(j.bytes)} · ${j.chars} chars`;
+    $('qrWarn').textContent=j.warn||'';
+    status('QR code ready.','ok');
+  }catch(err){
+    if(seq!==qrSeq) return;
+    qrResult=null; $('qrImg').style.display='none'; $('qrEmpty').style.display='';
+    $('qrStat').textContent=''; $('qrWarn').textContent='';
+    status('QR failed: '+err.message,'err');
+  }
+  render();
+}
+
+function qrDownload(){
+  if(!qrResult){toast('Nothing to download yet');return;}
+  const bin=atob(qrResult.image);
+  const arr=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++)arr[i]=bin.charCodeAt(i);
+  const blob=new Blob([arr],{type:qrResult.mime});
+  const url=URL.createObjectURL(blob);
+  const stem=(qrFieldValues().text||qrKind).replace(/^https?:\/\//,'')
+    .replace(/[^\w.\-]+/g,'_').slice(0,40)||'qr';
+  const a=document.createElement('a');
+  a.href=url; a.download=stem+'_qr.'+($('qrFmt').value==='jpg'?'jpg':'png');
+  document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);
+  toast('Downloaded','ok');
+  status('Saved '+a.download+' — scan it once before you print it.','ok');
+}
+
+/* ---------- image: load, crop, export ---------- */
+function imgAR(){
+  const v=imgState.ar;
+  if(v===null||v==='free')return null;
+  if(v==='orig')return imgState.w/imgState.h;
+  if(v==='full')return null;
+  return parseFloat(v);
+}
+function cropScale(){ const im=$('imgPrev'); return (im.clientWidth||1)/(imgState.w||1); }
+function drawCrop(){
+  const c=imgState.crop; if(!c)return;
+  const s=cropScale(), b=$('cropBox');
+  b.style.left=(c.x*s)+'px';  b.style.top=(c.y*s)+'px';
+  b.style.width=(c.w*s)+'px'; b.style.height=(c.h*s)+'px';
+  syncOutFields();
+}
+function syncOutFields(){
+  const c=imgState.crop; if(!c)return;
+  let w=Math.round(c.w), h=Math.round(c.h);
+  if(imgState.rotate===90||imgState.rotate===270){const t=w;w=h;h=t;}
+  $('outW').value=w; $('outH').value=h;
+  $('imgInfo').textContent=
+    `Source ${imgState.w}×${imgState.h} · crop ${Math.round(c.w)}×${Math.round(c.h)}`
+    +` at (${Math.round(c.x)}, ${Math.round(c.y)})`
+    +(imgState.rotate?` · rotated ${imgState.rotate}°`:'')
+    +(imgState.flip?' · flipped':'');
+}
+function fitCrop(ar){
+  const W=imgState.w,H=imgState.h;
+  if(!ar){ imgState.crop={x:0,y:0,w:W,h:H}; return; }
+  let w=W, h=w/ar;
+  if(h>H){ h=H; w=h*ar; }
+  imgState.crop={x:(W-w)/2, y:(H-h)/2, w, h};
+}
+document.querySelectorAll('#arChips .chip').forEach(c=>c.onclick=()=>{
+  document.querySelectorAll('#arChips .chip').forEach(x=>x.classList.remove('active'));
+  c.classList.add('active'); imgState.ar=c.dataset.ar;
+  if(c.dataset.ar==='full'){ imgState.crop={x:0,y:0,w:imgState.w,h:imgState.h}; }
+  else if(c.dataset.ar!=='free'){ fitCrop(imgAR()); }
+  drawCrop();
+});
+$('cropReset').onclick=()=>{
+  imgState.rotate=0; imgState.flip=false;
+  imgState.crop={x:0,y:0,w:imgState.w,h:imgState.h};
+  document.querySelectorAll('#arChips .chip').forEach((x,i)=>
+    x.classList.toggle('active',i===0));
+  imgState.ar='free'; drawCrop();
+};
+$('imgRot').onclick=()=>{imgState.rotate=(imgState.rotate+90)%360;syncOutFields();
+  toast('Rotation applies on export');};
+$('imgFlip').onclick=()=>{imgState.flip=!imgState.flip;syncOutFields();
+  toast('Flip applies on export');};
+$('imgFmt').onchange=()=>$('imgQWrap').classList.toggle('hide',$('imgFmt').value==='png');
+$('imgQ').oninput=()=>$('imgQVal').textContent=$('imgQ').value;
+$('outW').oninput=()=>{
+  const c=imgState.crop; if(!c)return;
+  const w=+$('outW').value; if(w>0) $('outH').value=Math.max(1,Math.round(w*c.h/c.w));
+};
+$('outH').oninput=()=>{
+  const c=imgState.crop; if(!c)return;
+  const h=+$('outH').value; if(h>0) $('outW').value=Math.max(1,Math.round(h*c.w/c.h));
+};
+
+let cropDrag=null;
+$('cropWrap').addEventListener('pointerdown',e=>{
+  if(!imgState.crop)return;
+  const cls=[...e.target.classList];
+  const hand=cls.includes('h')?['nw','ne','sw','se'].find(h=>cls.includes(h)):null;
+  if(!hand && e.target.id!=='cropBox') return;
+  e.preventDefault();
+  $('cropWrap').setPointerCapture(e.pointerId);
+  cropDrag={hand,sx:e.clientX,sy:e.clientY,start:{...imgState.crop}};
+});
+$('cropWrap').addEventListener('pointermove',e=>{
+  if(!cropDrag)return;
+  const s=cropScale(), st=cropDrag.start, W=imgState.w, H=imgState.h;
+  const dx=(e.clientX-cropDrag.sx)/s, dy=(e.clientY-cropDrag.sy)/s;
+  const MIN=16;
+  if(!cropDrag.hand){
+    imgState.crop={x:Math.max(0,Math.min(W-st.w,st.x+dx)),
+                   y:Math.max(0,Math.min(H-st.h,st.y+dy)),w:st.w,h:st.h};
+  }else{
+    let x0=st.x, y0=st.y, x1=st.x+st.w, y1=st.y+st.h;
+    if(cropDrag.hand.includes('w')) x0=st.x+dx; else x1=st.x+st.w+dx;
+    if(cropDrag.hand.includes('n')) y0=st.y+dy; else y1=st.y+st.h+dy;
+    x0=Math.max(0,Math.min(x0,x1-MIN)); x1=Math.min(W,Math.max(x1,x0+MIN));
+    y0=Math.max(0,Math.min(y0,y1-MIN)); y1=Math.min(H,Math.max(y1,y0+MIN));
+    let c={x:x0,y:y0,w:x1-x0,h:y1-y0};
+    const ar=imgAR();
+    if(ar){                                   // keep the locked ratio exact
+      let w=c.w, h=w/ar;
+      if(h>H){h=H;w=h*ar;}
+      if(cropDrag.hand.includes('w')) c.x=x1-w;
+      if(cropDrag.hand.includes('n')) c.y=y1-h;
+      c.w=w; c.h=h;
+      c.x=Math.max(0,Math.min(c.x,W-w)); c.y=Math.max(0,Math.min(c.y,H-h));
+    }
+    imgState.crop=c;
+  }
+  drawCrop();
+});
+['pointerup','pointercancel'].forEach(ev=>
+  $('cropWrap').addEventListener(ev,()=>{cropDrag=null;}));
+window.addEventListener('resize',()=>{ if(tab==='image'&&imgState.crop) drawCrop(); });
+
+async function imgLoad(body){
+  $('bar').classList.add('show'); status('Loading image…');
+  try{
+    const res=await fetch('/img_fetch',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!res.ok) throw new Error(await res.text());
+    const j=await res.json();
+    imgState.token=j.token; imgState.name=j.name;
+    imgState.w=j.width; imgState.h=j.height;
+    imgState.crop={x:0,y:0,w:j.width,h:j.height};
+    imgState.ar='free'; imgState.rotate=0; imgState.flip=false;
+    document.querySelectorAll('#arChips .chip').forEach((x,i)=>
+      x.classList.toggle('active',i===0));
+    const im=$('imgPrev');
+    im.onload=()=>drawCrop();
+    im.src='data:image/jpeg;base64,'+j.preview;
+    $('imgEditor').classList.remove('hide');
+    drawCrop();
+    status(`${j.name} — ${j.width}×${j.height} ${j.format}, ${human(j.bytes)}. `
+      +'Drag the box to crop.','ok');
+  }catch(err){
+    status('Could not load that image: '+err.message,'err');
+    toast('Image load failed','err');
+  }finally{$('bar').classList.remove('show');render();}
+}
+async function imgReload(){
+  if(imgState.b64) return imgLoad({file:{name:imgState.name,data:imgState.b64}});
+  if(imgState.url) return imgLoad({url:imgState.url});
+}
+$('imgFetch').onclick=()=>{
+  const u=$('imgUrl').value.trim();
+  if(!u){toast('Paste an image URL first');return;}
+  imgState.url=u; imgState.b64=null; imgLoad({url:u});
+};
+$('imgUrl').addEventListener('keydown',e=>{if(e.key==='Enter')$('imgFetch').click();});
+$('imgDrop').onclick=()=>$('imgFile').click();
+function imgTakeFile(file){
+  if(!file)return;
+  if(!/^image\//.test(file.type)){toast('That is not an image','err');return;}
+  const r=new FileReader();
+  r.onload=()=>{
+    const b64=String(r.result).split(',')[1];
+    imgState.b64=b64; imgState.url=''; imgState.name=file.name;
+    imgLoad({file:{name:file.name,data:b64}});
+  };
+  r.readAsDataURL(file);
+}
+$('imgFile').onchange=e=>{imgTakeFile(e.target.files[0]);e.target.value='';};
+['dragenter','dragover'].forEach(ev=>$('imgDrop').addEventListener(ev,e=>{
+  e.preventDefault();e.stopPropagation();$('imgDrop').classList.add('hot');}));
+['dragleave','drop'].forEach(ev=>$('imgDrop').addEventListener(ev,e=>{
+  e.preventDefault();e.stopPropagation();$('imgDrop').classList.remove('hot');}));
+$('imgDrop').addEventListener('drop',e=>imgTakeFile(e.dataTransfer.files[0]));
+
+/* ---------- boot ---------- */
+fetch('/capabilities').then(r=>r.json()).then(c=>{
+  caps=c;
+  $('pillLO').textContent='LibreOffice '+(c.libreoffice?'✓':'—');
+  $('pillLO').className='pill '+(c.libreoffice?'on':'off');
+  $('pillGS').textContent='Ghostscript '+(c.ghostscript?'✓':'—');
+  $('pillGS').className='pill '+(c.ghostscript?'on':'off');
+  $('pillFF').textContent='ffmpeg '+(c.ffmpeg?'✓':'—');
+  $('pillFF').className='pill '+(c.ffmpeg?'on':'off');
+  refreshWarn();
+}).catch(()=>{});
+qrBuildFields(); updateAccept(); selectTab('merge');
+</script></body></html>
+"""
+
+
+def main():
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}/"
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    lo = "yes" if office_binary() else "no (Office→PDF disabled until installed)"
+    gs = "yes (best compression)" if gs_binary() else "no (pure-Python compression used)"
+    ff = ("yes (full-res video + 9:16 reframing)" if ffmpeg_binary()
+          else "no (video capped ~720p, no vertical reframing)")
+    print("=" * 60)
+    print("  Multi Toolkit — running locally")
+    print("  PDF: merge · split · compress · convert")
+    print("  Media: youtube · reels · image · qr code")
+    print(f"  Open:          {url}")
+    print(f"  LibreOffice:   {lo}")
+    print(f"  Ghostscript:   {gs}")
+    print(f"  ffmpeg:        {ff}")
+    print("  Ctrl-C here to stop.")
+    print("=" * 60)
+    threading.Timer(0.7, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    main()
