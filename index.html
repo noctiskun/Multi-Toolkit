@@ -8,186 +8,232 @@
 <meta property="og:title" content="Multi Toolkit">
 <meta property="og:description" content="PDFs, media and QR codes — running entirely on your own machine.">
 <meta property="og:type" content="website">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%238b7bff'/><rect x='7' y='7' width='7' height='7' fill='%23fff'/><rect x='18' y='7' width='7' height='7' fill='%23fff'/><rect x='7' y='18' width='7' height='7' fill='%23fff'/><rect x='19' y='19' width='4' height='4' fill='%23fff'/></svg>">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%23100E0C'/><rect x='6' y='6' width='9' height='9' fill='%23FFB000'/><rect x='17' y='6' width='9' height='9' fill='%23EFE9E1'/><rect x='6' y='17' width='9' height='9' fill='%23EFE9E1'/><rect x='19' y='19' width='5' height='5' fill='%23FFB000'/></svg>"><rect width='32' height='32' rx='7' fill='%238b7bff'/><rect x='7' y='7' width='7' height='7' fill='%23fff'/><rect x='18' y='7' width='7' height='7' fill='%23fff'/><rect x='7' y='18' width='7' height='7' fill='%23fff'/><rect x='19' y='19' width='4' height='4' fill='%23fff'/></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-  :root{
-    --bg:#0d0d15; --panel:#171724; --panel2:#1f1f31; --line:#302f4a;
-    --ink:#ecebf7; --mut:#9b99bd; --acc:#8b7bff; --acc-hi:#a99cff;
-    --ok:#46d6a4; --amber:#ffc66b;
-    --mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
-  }
-  *{box-sizing:border-box} ::selection{background:#8b7bff55}
-  html{color-scheme:dark;scroll-behavior:smooth}
-  body{margin:0;background:var(--bg);color:var(--ink);
-    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
-  .wrap{max-width:980px;margin:0 auto;padding:0 20px}
-  a{color:var(--acc-hi)}
-  code,kbd{font-family:var(--mono);font-size:.88em;background:var(--panel2);
-    border:1px solid var(--line);border-radius:5px;padding:1.5px 6px}
-  pre{background:var(--panel);border:1px solid var(--line);border-radius:11px;
-    padding:14px 16px;overflow-x:auto;font:13.5px/1.6 var(--mono);margin:0 0 14px}
-  pre code{background:none;border:0;padding:0;font-size:inherit}
+/* ==========================================================================
+   Multi Toolkit — project page. Same chassis as the app: warm graphite,
+   silkscreen mono labels, amber for measured facts, steel for things you touch.
+   The hero is the instrument itself, not a picture of it.
+   ========================================================================== */
+:root{
+  --void:#100E0C; --bench:#191512; --riser:#221D19;
+  --edge:#342C26; --edge-hi:#4A3F36;
+  --paper:#EFE9E1; --dim:#9C8F84; --faint:#827568;
+  --amber:#FFB000; --amber-dk:#5C4410; --steel:#7FAECF; --steel-dim:#2C4557;
+  --rust:#DC6148; --ok:#8FBF7A;
+  --disp:"Archivo",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --ui:"Archivo",system-ui,-apple-system,"Segoe UI",Helvetica,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  --r:4px; --r-lg:7px; --gut:clamp(18px,4vw,40px);
+}
+*{box-sizing:border-box}
+::selection{background:var(--steel);color:var(--void)}
+html{color-scheme:dark;scroll-behavior:smooth}
+body{margin:0;background:var(--void);color:var(--paper);
+  font:16px/1.6 var(--ui);font-variant-numeric:tabular-nums;
+  -webkit-font-smoothing:antialiased}
+:focus-visible{outline:2px solid var(--steel);outline-offset:2px}
+a{color:var(--steel)}
+.wrap{max-width:1080px;margin:0 auto;padding:0 var(--gut)}
+.lab{font:600 10px/1 var(--mono);letter-spacing:.2em;text-transform:uppercase;
+  color:var(--faint)}
 
-  header{padding:64px 0 30px;border-bottom:1px solid var(--line)}
-  .eyebrow{font:600 11px/1 var(--mono);letter-spacing:.24em;color:var(--acc);
-    margin-bottom:14px}
-  h1{font-size:clamp(34px,6vw,52px);margin:0 0 12px;letter-spacing:-.03em;line-height:1.05}
-  .lede{font-size:19px;color:var(--mut);max-width:62ch;margin:0 0 22px}
-  .lede b{color:var(--ink);font-weight:600}
-  .cta{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-  .btn{display:inline-block;font:600 15px/1 inherit;border-radius:10px;
-    padding:13px 22px;text-decoration:none;transition:.13s;border:1px solid var(--line)}
-  .btn.p{background:var(--acc);color:#fff;border-color:var(--acc)}
-  .btn.p:hover{background:var(--acc-hi)}
-  .btn.s{background:var(--panel);color:var(--ink)}
-  .btn.s:hover{background:var(--panel2)}
-  .badges{display:flex;gap:6px;flex-wrap:wrap;margin-top:20px}
-  .badge{font:500 11.5px var(--mono);padding:5px 11px;border-radius:99px;
-    border:1px solid var(--line);color:var(--mut);background:var(--panel)}
+/* ---------- masthead ---------- */
+.masthead{position:sticky;top:0;z-index:50;display:flex;align-items:center;
+  gap:16px;padding:12px var(--gut);background:#191512F2;backdrop-filter:blur(10px);
+  border-bottom:1px solid var(--edge)}
+.brand{display:flex;align-items:center;gap:10px;margin-right:auto}
+.brand .mark{font:600 14px/1 var(--mono);color:var(--void);background:var(--amber);
+  padding:5px 6px;border-radius:2px;letter-spacing:-.06em}
+.brand b{font:600 15px/1 var(--disp);letter-spacing:-.01em}
+.masthead .lab{display:none}
+@media (min-width:640px){.masthead .lab{display:block}}
+.ghost{font:600 11px/1 var(--mono);letter-spacing:.11em;text-transform:uppercase;
+  color:var(--paper);text-decoration:none;padding:8px 13px;border-radius:var(--r);
+  border:1px solid var(--edge-hi);background:var(--riser);transition:.13s;
+  white-space:nowrap}
+.ghost:hover{background:var(--edge);border-color:var(--steel)}
 
-  section{padding:52px 0;border-bottom:1px solid var(--line)}
-  h2{font-size:27px;margin:0 0 8px;letter-spacing:-.02em}
-  h3{font-size:17px;margin:26px 0 8px}
-  .sub{color:var(--mut);margin:0 0 26px;max-width:64ch}
+/* ---------- hero ---------- */
+.hero{padding:clamp(38px,7vw,70px) 0 10px}
+.hero h1{margin:14px 0 0;font-family:var(--disp);font-weight:800;
+  font-stretch:118%;letter-spacing:-.035em;line-height:.98;
+  font-size:clamp(37px,7.2vw,72px)}
+.hero h1 em{font-style:normal;color:var(--faint)}
+.hero p{margin:20px 0 0;max-width:56ch;font-size:clamp(16px,1.9vw,19px);
+  line-height:1.55;color:var(--dim)}
+.hero p b{color:var(--paper);font-weight:600}
+.cmd{display:inline-flex;align-items:center;gap:11px;margin-top:26px;
+  padding:12px 16px;border-radius:var(--r);background:var(--bench);
+  border:1px solid var(--edge);font:500 14px/1 var(--mono);color:var(--paper)}
+.cmd s{color:var(--amber);text-decoration:none}
 
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;
-    padding:17px 18px}
-  .card h4{margin:0 0 7px;font-size:15.5px;display:flex;align-items:center;gap:8px}
-  .card p{margin:0;color:var(--mut);font-size:14px;line-height:1.55}
-  .card .tag{font:600 10px var(--mono);letter-spacing:.1em;color:var(--acc);
-    border:1px solid var(--line);border-radius:99px;padding:3px 8px;margin-left:auto}
+/* ---------- the instrument ---------- */
+.instrument{margin:34px 0 0;border:1px solid var(--edge);border-radius:10px;
+  background:var(--bench);overflow:hidden}
+.readout{display:flex;flex-wrap:wrap;gap:0 clamp(18px,3.4vw,34px);
+  align-items:flex-end;padding:14px 18px;
+  background:linear-gradient(180deg,#0C0A08,#080706);
+  border-bottom:1px solid var(--edge);box-shadow:inset 0 0 40px #FFB0000d}
+.ro-cell{display:flex;flex-direction:column-reverse;gap:3px;min-width:0}
+.ro-cell i{font:600 9.5px/1 var(--mono);letter-spacing:.19em;
+  text-transform:uppercase;color:var(--faint);font-style:normal}
+.ro-cell b{font:500 20px/1.05 var(--mono);color:var(--amber);
+  text-shadow:0 0 16px #FFB00040;white-space:nowrap}
+.readout[data-state="idle"] .ro-cell b{color:var(--faint);text-shadow:none;
+  font-size:15px;font-weight:400}
+.panel{display:grid;grid-template-columns:minmax(0,1fr) 300px;align-items:start}
+.controls{padding:18px;min-width:0}
+.viewer{padding:18px;border-left:1px solid var(--edge);position:sticky;top:64px}
+@media (max-width:800px){
+  .panel{grid-template-columns:1fr}
+  .viewer{border-left:0;border-top:1px solid var(--edge);position:static}
+}
+.caption{margin:12px 0 0;font:11.5px/1.5 var(--mono);color:var(--faint);
+  letter-spacing:.03em}
+.caption s{color:var(--amber);text-decoration:none}
 
-  .note{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--amber);
-    border-radius:11px;padding:15px 17px;color:var(--mut);font-size:14.5px}
-  .note b{color:var(--amber)}
-  .note.ok{border-left-color:var(--ok)} .note.ok b{color:var(--ok)}
+/* ---------- controls ---------- */
+.chips{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:15px}
+.chip{font:600 11px/1 var(--mono);letter-spacing:.06em;padding:7px 10px;
+  border-radius:var(--r);cursor:pointer;user-select:none;transition:.12s;
+  border:1px solid var(--edge);background:var(--void);color:var(--dim)}
+.chip:hover{color:var(--paper);border-color:var(--edge-hi)}
+.chip.active{background:var(--steel-dim);border-color:var(--steel);color:#CFE6F5}
+.fld{display:flex;flex-direction:column;gap:5px;margin-bottom:11px}
+.fld>span{font:600 9.5px/1 var(--mono);letter-spacing:.19em;
+  text-transform:uppercase;color:var(--faint)}
+.fld>span:empty{display:none}
+input[type=text],select,textarea{width:100%;background:var(--void);
+  color:var(--paper);border:1px solid var(--edge-hi);border-radius:var(--r);
+  padding:9px 11px;font:15px var(--ui)}
+textarea{min-height:74px;resize:vertical;line-height:1.5}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--steel)}
+input:disabled,select:disabled{opacity:.45}
+input[type=color]{width:42px;height:30px;padding:0;border:1px solid var(--edge-hi);
+  border-radius:var(--r);background:none;cursor:pointer}
+input[type=checkbox]{accent-color:var(--steel);width:15px;height:15px}
+input[type=range]{accent-color:var(--amber);width:104px}
+.set{border-top:1px solid var(--edge);margin-top:16px;padding-top:14px}
+.set>.lab{display:block;margin-bottom:11px}
+.row{display:flex;gap:13px;flex-wrap:wrap;align-items:center}
+.row label{display:flex;align-items:center;gap:7px;font-size:13.5px;color:var(--dim)}
+.row select{width:auto}
+.pct{font:600 12px var(--mono);color:var(--amber);min-width:36px}
+.logodrop{border:1px dashed var(--edge-hi);border-radius:var(--r-lg);padding:13px;
+  text-align:center;color:var(--dim);cursor:pointer;font-size:13.5px;
+  line-height:1.5;transition:.13s}
+.logodrop:hover,.logodrop.hot{border-color:var(--steel);color:var(--paper);
+  background:var(--riser)}
+.logochip{display:flex;align-items:center;gap:11px;margin-top:11px}
+.logochip img{width:42px;height:42px;object-fit:contain;border-radius:var(--r);
+  background:#fff;border:1px solid var(--edge);flex:none}
+.logochip .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;font-size:13.5px}
+.mini{font:13px var(--ui);padding:6px 12px;cursor:pointer;border-radius:var(--r);
+  border:1px solid var(--edge-hi);background:var(--riser);color:var(--paper)}
+.mini:hover{background:var(--edge)}
+.sheet{width:100%;aspect-ratio:1;border-radius:var(--r-lg);
+  border:1px solid var(--edge);display:flex;align-items:center;
+  justify-content:center;overflow:hidden;background-color:#fff;
+  background-size:16px 16px;background-position:0 0,8px 8px;
+  background-image:
+    linear-gradient(45deg,#E4E0D8 25%,transparent 25%,transparent 75%,#E4E0D8 75%),
+    linear-gradient(45deg,#E4E0D8 25%,transparent 25%,transparent 75%,#E4E0D8 75%)}
+.sheet canvas{width:100%;height:100%;object-fit:contain;display:block}
+.warnline{margin-top:10px;font-size:12.5px;line-height:1.5;color:var(--amber)}
+.warnline:empty{display:none}
+.grab{width:100%;margin-top:12px;padding:12px;cursor:pointer;
+  border-radius:var(--r);font:600 14px var(--ui);background:var(--steel);
+  color:#0B1219;border:1px solid var(--steel);transition:.12s}
+.grab:hover:not(:disabled){background:#98C1DE}
+.grab:disabled{background:var(--riser);color:var(--faint);
+  border-color:var(--edge);cursor:not-allowed}
 
-  /* demo */
-  .demo{display:grid;grid-template-columns:1fr 300px;gap:16px;align-items:start}
-  @media (max-width:760px){.demo{grid-template-columns:1fr}}
-  .fld{display:flex;flex-direction:column;gap:5px;margin-bottom:11px}
-  .fld>span{font:11px var(--mono);color:var(--mut);letter-spacing:.09em;text-transform:uppercase}
-  input[type=text],select,textarea{background:var(--panel2);color:var(--ink);
-    border:1px solid var(--line);border-radius:8px;padding:9px 11px;font:inherit;width:100%}
-  input[type=text]:focus,textarea:focus{outline:none;border-color:var(--acc)}
-  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-  .row label{font-size:13.5px;color:var(--mut);display:flex;align-items:center;gap:7px}
-  input[type=color]{width:44px;height:32px;padding:0;border:1px solid var(--line);
-    border-radius:7px;background:none;cursor:pointer}
-  input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
-  input[type=range]{accent-color:var(--acc);width:110px}
-  .chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:13px}
-  .chip{font:600 12.5px var(--mono);padding:6px 12px;border-radius:99px;cursor:pointer;
-    border:1px solid var(--line);color:var(--mut);background:var(--panel);
-    transition:.13s;user-select:none}
-  .chip:hover{color:var(--ink)}
-  .chip.active{background:var(--acc);border-color:var(--acc);color:#fff}
-  .sheet{width:100%;aspect-ratio:1;border-radius:13px;border:1px solid var(--line);
-    display:flex;align-items:center;justify-content:center;overflow:hidden;
-    background-color:#fff;background-size:18px 18px;background-position:0 0,9px 9px;
-    background-image:linear-gradient(45deg,#e6e6f0 25%,transparent 25%,transparent 75%,#e6e6f0 75%),
-      linear-gradient(45deg,#e6e6f0 25%,transparent 25%,transparent 75%,#e6e6f0 75%)}
-  .sheet canvas{width:100%;height:100%;object-fit:contain;display:block;
-    image-rendering:pixelated}
-  .stat{font:11.5px/1.5 var(--mono);color:var(--mut);text-align:center;margin-top:9px}
-  .warnline{font-size:12.5px;line-height:1.5;color:var(--amber);margin-top:7px}
-  .stage{position:sticky;top:18px}
-  .logodrop{border:1.5px dashed var(--line);border-radius:11px;padding:13px;
-    text-align:center;color:var(--mut);cursor:pointer;font-size:13.5px;transition:.13s}
-  .logodrop:hover,.logodrop.hot{border-color:var(--acc);color:var(--ink);background:var(--panel2)}
-  .logochip{display:flex;align-items:center;gap:11px;margin-top:11px}
-  .logochip img{width:44px;height:44px;object-fit:contain;border-radius:8px;
-    background:#fff;border:1px solid var(--line);flex:none}
-  .logochip .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
-    white-space:nowrap;font-size:13.5px}
-  .mini{font:inherit;font-size:13px;border:1px solid var(--line);border-radius:8px;
-    padding:6px 12px;cursor:pointer;background:var(--panel);color:var(--ink)}
-  .mini:hover{background:var(--panel2)}
+/* ---------- sections ---------- */
+section{padding:clamp(46px,7vw,78px) 0;border-top:1px solid var(--edge)}
+section h2{margin:12px 0 0;font-family:var(--disp);font-weight:800;
+  font-stretch:112%;letter-spacing:-.028em;line-height:1.04;
+  font-size:clamp(26px,3.8vw,40px)}
+section h2 em{font-style:normal;color:var(--faint)}
+section .sub{margin:14px 0 0;max-width:60ch;color:var(--dim);font-size:16.5px}
 
-  table{width:100%;border-collapse:collapse;font-size:14.5px}
-  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
-  th{font:600 11px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--mut)}
-  td code{white-space:nowrap}
+/* a parts list, not a card grid */
+.spec{margin:30px 0 0;border-top:1px solid var(--edge)}
+.spec-row{display:grid;grid-template-columns:136px minmax(0,1fr);
+  gap:clamp(12px,3vw,30px);padding:15px 0;border-bottom:1px solid var(--edge);
+  align-items:baseline}
+.spec-row dt{font:600 11px/1.4 var(--mono);letter-spacing:.14em;
+  text-transform:uppercase;color:var(--paper)}
+.spec-row dd{margin:0;color:var(--dim);font-size:15px;line-height:1.55}
+.spec-row dd b{color:var(--paper);font-weight:600}
+.tagl{display:inline-block;margin-left:8px;font:600 9.5px/1 var(--mono);
+  letter-spacing:.14em;text-transform:uppercase;color:var(--amber);
+  border:1px solid var(--amber-dk);border-radius:2px;padding:3px 6px}
+.spec-head{display:flex;align-items:baseline;gap:12px;padding:24px 0 8px;
+  border-bottom:1px solid var(--edge-hi)}
+.spec-head b{font:600 11px/1 var(--mono);letter-spacing:.2em;
+  text-transform:uppercase;color:var(--amber)}
+.spec-head span{font:11px/1 var(--mono);color:var(--faint);letter-spacing:.06em}
 
-  footer{padding:38px 0 60px;color:var(--mut);font-size:13.5px}
-  footer a{color:var(--mut)}
-  @media (prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto}}
+pre{background:var(--bench);border:1px solid var(--edge);border-radius:var(--r-lg);
+  padding:15px 17px;overflow-x:auto;font:13.5px/1.7 var(--mono);margin:24px 0 14px}
+code{font-family:var(--mono);font-size:.9em}
+p code,dd code{background:var(--riser);border:1px solid var(--edge);
+  border-radius:3px;padding:1.5px 6px}
+kbd{font:12px var(--mono);background:var(--riser);border:1px solid var(--edge-hi);
+  border-bottom-width:2px;border-radius:3px;padding:2px 6px}
+.note{margin-top:22px;padding:16px 18px;border-radius:var(--r-lg);
+  background:var(--bench);border:1px solid var(--edge);
+  border-left:2px solid var(--amber);color:var(--dim);font-size:15px;
+  line-height:1.6}
+.note b{color:var(--amber);font-weight:600}
+table{width:100%;border-collapse:collapse;margin-top:24px;font-size:14.5px}
+th,td{text-align:left;padding:11px 16px 11px 0;
+  border-bottom:1px solid var(--edge);vertical-align:top}
+th{font:600 10px/1 var(--mono);letter-spacing:.18em;text-transform:uppercase;
+  color:var(--faint)}
+td:last-child{font-family:var(--mono);font-size:12.5px;line-height:1.9;
+  color:var(--dim)}
+footer{padding:34px 0 56px;color:var(--faint);font-size:13px;line-height:1.7;
+  border-top:1px solid var(--edge)}
+footer a{color:var(--dim)}
+@media (prefers-reduced-motion:reduce){
+  *{animation-duration:.001ms!important;transition-duration:.001ms!important;
+    scroll-behavior:auto!important}
+}
 </style>
 </head>
 <body>
 
-<header>
-  <div class="wrap">
-    <div class="eyebrow">LOCAL WORKBENCH · SINGLE FILE · NO ACCOUNT</div>
-    <h1>Multi Toolkit</h1>
-    <p class="lede">PDFs, video and QR codes in one browser tab — served by a
-      <b>tiny Python file running on your own machine</b>. Your files never leave
-      your computer, because there is no server to send them to.</p>
-    <div class="cta">
-      <a class="btn p" href="#install">Get started</a>
-      <a class="btn s" href="#qr">Try the QR generator</a>
-      <a class="btn s" id="repoLink" href="#install">View on GitHub</a>
-    </div>
-    <div class="badges">
-      <span class="badge">Python 3.8+</span>
-      <span class="badge">Windows · macOS · Linux</span>
-      <span class="badge">127.0.0.1 only</span>
-      <span class="badge">MIT</span>
-    </div>
+<header class="masthead">
+  <div class="brand">
+    <span class="mark" aria-hidden="true">&#9626;</span>
+    <b>Multi Toolkit</b>
   </div>
+  <span class="lab">local workbench</span>
+  <a class="ghost" id="repoLink" href="#install">GitHub</a>
 </header>
 
-<section>
-  <div class="wrap">
-    <h2>What it does</h2>
-    <p class="sub">Two groups of tools, eight tabs. The browser is just the
-      interface — there's no GUI framework to install and nothing to sign into.</p>
-
-    <h3>PDF</h3>
-    <div class="grid">
-      <div class="card"><h4>Merge</h4>
-        <p>Combine any number of PDFs, drag the rows to reorder, and optionally
-          drop a bookmark in for each source file.</p></div>
-      <div class="card"><h4>Split</h4>
-        <p>A visual page grid: click <em>between</em> pages to place cut points,
-          or click pages to pull them out. Also every-page, every-N, ranges and
-          full reordering.</p></div>
-      <div class="card"><h4>Compress</h4>
-        <p>Four presets with real size estimates measured before you commit —
-          from lossless structure cleanup to hard image downscaling.</p></div>
-      <div class="card"><h4>Convert</h4>
-        <p>Office&nbsp;→&nbsp;PDF, PDF&nbsp;→&nbsp;Word, PDF&nbsp;→&nbsp;PowerPoint,
-          PDF&nbsp;→&nbsp;images, and images&nbsp;→&nbsp;PDF.</p></div>
-    </div>
-
-    <h3>Photo &amp; Video</h3>
-    <div class="grid">
-      <div class="card"><h4>YouTube</h4>
-        <p>Pick a resolution and container, watch live progress, and optionally
-          re-encode to HEVC/H.264 so 4K actually plays in QuickTime.</p></div>
-      <div class="card"><h4>Reels</h4>
-        <p>Instagram, TikTok and Shorts — plus 9:16 reframing with a blurred
-          backdrop that crops nothing, a crop-to-fill, or plain black bars.</p></div>
-      <div class="card"><h4>Image</h4>
-        <p>Load from a URL or a file, drag a crop box with locked ratios,
-          rotate, flip, resize, and export PNG, JPG or WebP.</p></div>
-      <div class="card"><h4>QR Code<span class="tag">LIVE BELOW</span></h4>
-        <p>Links, Wi-Fi, contact cards and more, with a centre logo and a
-          silhouette mode that makes the logo read as part of the code.</p></div>
-    </div>
+<div class="wrap">
+  <div class="hero">
+    <span class="lab">one python file &middot; no account &middot; no upload</span>
+    <h1>PDFs, video and QR codes.<br><em>On your machine, not ours.</em></h1>
+    <p>Merge and split PDFs, pull down video and reframe it to 9:16, crop images,
+      build QR codes with a logo in the middle. It runs a small server on
+      <b>127.0.0.1</b> and your browser is the interface &mdash; so your files
+      never travel, because there is nowhere to send them.</p>
+    <div class="cmd"><s>$</s> python multi_toolkit.py</div>
   </div>
-</section>
 
-<section id="qr">
-  <div class="wrap">
-    <h2>QR generator — running right here</h2>
-    <p class="sub">This one needs no server, so it works on this page exactly as
-      it does in the app. Everything below happens in your browser; nothing is
-      sent anywhere.</p>
-
-    <div class="demo">
-      <div>
+  <!-- The hero is the tool, running. Not a screenshot of it. -->
+  <div class="instrument">
+    <div class="readout" id="readout" data-state="idle" aria-live="polite"></div>
+    <div class="panel">
+      <div class="controls">
         <div class="chips" id="kinds">
           <span class="chip active" data-k="url">Link</span>
           <span class="chip" data-k="text">Text</span>
@@ -198,135 +244,203 @@
         </div>
         <div id="fields"></div>
 
-        <h3 style="margin-top:22px">Centre logo</h3>
-        <div class="logodrop" id="logoDrop">
-          <b>Drop a logo</b> or click to choose — a PNG with a transparent
-          background works best
-          <input type="file" id="logoFile" accept="image/*" hidden>
-        </div>
-        <div class="logochip" id="logoChip" hidden>
-          <img id="logoThumb" alt="">
-          <span class="nm" id="logoName"></span>
-          <button class="mini" id="logoClear">Remove</button>
-        </div>
-        <div class="row" id="logoOpts" hidden style="margin-top:12px">
-          <label>Size <input type="range" id="logoPct" min="8" max="34" value="24">
-            <b style="font:600 12px var(--mono);color:var(--acc)" id="logoPctVal">24%</b></label>
-          <label>Look <select id="logoStyle" style="width:auto">
-            <option value="original">Original colours</option>
-            <option value="silhouette" selected>Silhouette</option>
-          </select></label>
-          <label><input type="checkbox" id="plate"> Backing plate</label>
+        <div class="set">
+          <span class="lab">Centre logo</span>
+          <div class="logodrop" id="logoDrop">
+            <b>Drop a logo</b> or click to choose &mdash; PNG with a transparent
+            background works best
+            <input type="file" id="logoFile" accept="image/*" hidden>
+          </div>
+          <div class="logochip" id="logoChip" hidden>
+            <img id="logoThumb" alt="">
+            <span class="nm" id="logoName"></span>
+            <button class="mini" id="logoClear">Remove</button>
+          </div>
+          <div class="row" id="logoOpts" hidden style="margin-top:12px">
+            <label>Size <input type="range" id="logoPct" min="8" max="34" value="24">
+              <span class="pct" id="logoPctVal">24%</span></label>
+            <label>Look <select id="logoStyle">
+              <option value="original">Original colours</option>
+              <option value="silhouette" selected>Silhouette</option>
+            </select></label>
+            <label><input type="checkbox" id="plate"> Backing plate</label>
+          </div>
         </div>
 
-        <h3 style="margin-top:22px">Style</h3>
-        <div class="row">
-          <label>Modules <select id="style" style="width:auto">
-            <option value="square">Square</option>
-            <option value="dots">Dots</option>
-            <option value="rounded">Rounded</option>
-          </select></label>
-          <label>Foreground <input type="color" id="fg" value="#000000"></label>
-          <label>Background <input type="color" id="bg" value="#ffffff"></label>
-          <label><input type="checkbox" id="transparent"> Transparent</label>
-        </div>
-        <div class="row" style="margin-top:11px">
-          <label>Correction <select id="ec" style="width:auto">
-            <option value="L">L — 7%</option><option value="M">M — 15%</option>
-            <option value="Q">Q — 25%</option><option value="H" selected>H — 30%</option>
-          </select></label>
-          <label>Size <select id="size" style="width:auto">
-            <option value="512">512 px</option>
-            <option value="1024" selected>1024 px</option>
-            <option value="2048">2048 px</option>
-          </select></label>
-          <label>Quiet zone <input type="text" id="border" value="4"
-            inputmode="numeric" style="width:56px"></label>
+        <div class="set">
+          <span class="lab">Style</span>
+          <div class="row">
+            <label>Modules <select id="style">
+              <option value="square">Square</option>
+              <option value="dots">Dots</option>
+              <option value="rounded">Rounded</option>
+            </select></label>
+            <label>Ink <input type="color" id="fg" value="#000000"></label>
+            <label>Ground <input type="color" id="bg" value="#ffffff"></label>
+            <label><input type="checkbox" id="transparent"> Transparent</label>
+          </div>
+          <div class="row" style="margin-top:12px">
+            <label>Correction <select id="ec">
+              <option value="L">L &mdash; 7%</option><option value="M">M &mdash; 15%</option>
+              <option value="Q">Q &mdash; 25%</option><option value="H" selected>H &mdash; 30%</option>
+            </select></label>
+            <label>Size <select id="size">
+              <option value="512">512 px</option>
+              <option value="1024" selected>1024 px</option>
+              <option value="2048">2048 px</option>
+            </select></label>
+            <label>Quiet zone <input type="text" id="border" value="4"
+              inputmode="numeric" style="width:52px"></label>
+          </div>
         </div>
       </div>
 
-      <div class="stage">
-        <div class="sheet"><canvas id="cv" width="512" height="512"></canvas></div>
-        <div class="stat" id="stat">Type something to begin</div>
+      <div class="viewer">
+        <div class="sheet"><canvas id="cv" width="512" height="512"
+             aria-label="QR code preview"></canvas></div>
         <div class="warnline" id="warn"></div>
-        <button class="btn p" id="dl" style="width:100%;margin-top:12px;border:0;
-          cursor:pointer;font-size:14.5px;padding:12px">Download PNG</button>
+        <button class="grab" id="dl">Download PNG</button>
+        <p class="caption"><s>&#9650;</s> The real generator, running in your
+          browser. Nothing is sent anywhere.</p>
       </div>
     </div>
+  </div>
+</div>
 
-    <div class="note ok" style="margin-top:26px"><b>A habit worth keeping:</b>
-      scan every code with a real phone before you print it. Logos, low quiet
-      zones and light-on-dark colours all cost you error-correction headroom,
-      and a code that fails on a poster is expensive to discover late.</div>
+<section id="tools">
+  <div class="wrap">
+    <span class="lab">what's inside</span>
+    <h2>Eight tools, two benches.</h2>
+    <p class="sub">Everything below runs locally once you clone the repo. The QR
+      generator above is the one piece that needs no server, which is why it can
+      live on this page at all.</p>
+
+    <dl class="spec">
+      <div class="spec-head"><b>Documents</b><span>pdf</span></div>
+      <div class="spec-row"><dt>Merge</dt>
+        <dd>Combine any number of PDFs. Drag rows to reorder; optionally add a
+          bookmark for each source file.</dd></div>
+      <div class="spec-row"><dt>Split</dt>
+        <dd>A visual page grid. Click <b>between</b> pages to place cut points,
+          or click pages to pull them out. Also every-page, every-N, ranges, and
+          drag-to-reorder with deletion.</dd></div>
+      <div class="spec-row"><dt>Compress</dt>
+        <dd>Four presets, each showing a <b>measured</b> result size before you
+          commit &mdash; not an estimate. Uses Ghostscript when it's installed,
+          pure Python otherwise.</dd></div>
+      <div class="spec-row"><dt>Convert</dt>
+        <dd>Office &rarr; PDF, PDF &rarr; Word, PDF &rarr; PowerPoint,
+          PDF &rarr; images, images &rarr; PDF.</dd></div>
+
+      <div class="spec-head"><b>Media</b><span>a/v</span></div>
+      <div class="spec-row"><dt>YouTube</dt>
+        <dd>Pick a resolution and container, watch live progress. Optionally
+          re-encodes to H.264/HEVC with hardware acceleration so 4K actually
+          plays in QuickTime.</dd></div>
+      <div class="spec-row"><dt>Reels</dt>
+        <dd>Instagram, TikTok and Shorts, plus 9:16 reframing &mdash; a blurred
+          backdrop that crops nothing, a crop-to-fill, or black bars.</dd></div>
+      <div class="spec-row"><dt>Image</dt>
+        <dd>Load from a URL or a file, drag a crop box with locked ratios,
+          rotate, flip, resize, export PNG, JPG or WebP.</dd></div>
+      <div class="spec-row"><dt>QR Code<span class="tagl">live above</span></dt>
+        <dd>Links, Wi-Fi, contact cards and more, with a centre logo and a
+          silhouette mode that makes the mark read as part of the code.</dd></div>
+    </dl>
+  </div>
+</section>
+
+<section id="logo">
+  <div class="wrap">
+    <span class="lab">the logo trick</span>
+    <h2>Why the mark sits <em>inside</em> the code.</h2>
+    <p class="sub">Four things do the work, and the generator applies them for
+      you the moment you add a logo.</p>
+
+    <dl class="spec">
+      <div class="spec-row"><dt>Silhouette</dt>
+        <dd>Flattens your image to a single colour matching the code, so it reads
+          as part of the pattern rather than a sticker sitting on top.</dd></div>
+      <div class="spec-row"><dt>No plate</dt>
+        <dd>Skip the white rectangle behind the mark. The modules simply stop
+          where the shape begins.</dd></div>
+      <div class="spec-row"><dt>Correction H</dt>
+        <dd>Recovers roughly <b>30%</b> of a damaged code. That headroom is what
+          pays for covering the middle, and it switches on automatically.</dd></div>
+      <div class="spec-row"><dt>Square finders</dt>
+        <dd>The three big corner squares are never rounded, even in Dots mode.
+          Scanners lock onto them first, and rounding them is the quickest way to
+          break an otherwise valid code.</dd></div>
+    </dl>
+
+    <div class="note"><b>Scan it before you print it.</b> Every stylistic choice
+      spends error-correction headroom. The generator warns you when the logo
+      grows too large, the quiet zone drops below four modules, or contrast falls
+      too low &mdash; but a real phone camera is the only test that counts.</div>
   </div>
 </section>
 
 <section id="install">
   <div class="wrap">
-    <h2>Running it</h2>
-    <p class="sub">One file, one command. Dependencies install themselves the
-      first time a feature needs them.</p>
+    <span class="lab">running it</span>
+    <h2>One file. One command.</h2>
+    <p class="sub">Python 3.8 or newer is the only hard requirement. Packages
+      install themselves the first time a feature needs them.</p>
 
-    <pre><code>git clone https://github.com/&lt;your-username&gt;/multi-toolkit.git
+<pre><code>git clone https://github.com/&lt;your-username&gt;/multi-toolkit.git
 cd multi-toolkit
 python multi_toolkit.py</code></pre>
 
-    <p class="sub">Your browser opens automatically at
-      <code>http://127.0.0.1:8000</code>. Press <kbd>Ctrl</kbd>+<kbd>C</kbd> in
-      the terminal to stop it.</p>
+    <p class="sub">Your browser opens at <code>http://127.0.0.1:8000</code>.
+      Press <kbd>Ctrl</kbd>+<kbd>C</kbd> in the terminal to stop. If the port is
+      busy it moves to the next free one and prints where it landed.</p>
 
-    <div class="note"><b>This page can't run the whole app.</b> GitHub Pages
-      serves static files only — there's no Python process behind it, so merge,
-      split, video download and image cropping genuinely cannot work here. The
-      QR generator above is the exception, because QR encoding needs no server.
-      Everything else requires the clone-and-run above.</div>
-
-    <h3>Optional extras</h3>
     <table>
-      <tr><th>Tool</th><th>Unlocks</th><th>Install</th></tr>
+      <tr><th>Optional</th><th>Unlocks</th><th>Install</th></tr>
       <tr><td><b>ffmpeg</b></td>
           <td>Video above ~720p, and all 9:16 reframing</td>
-          <td><code>brew install ffmpeg</code><br>
-              <code>winget install Gyan.FFmpeg</code><br>
-              <code>apt install ffmpeg</code></td></tr>
+          <td>brew install ffmpeg<br>winget install Gyan.FFmpeg<br>apt install ffmpeg</td></tr>
       <tr><td><b>LibreOffice</b></td>
-          <td>Office&nbsp;→&nbsp;PDF conversion</td>
+          <td>Office &rarr; PDF conversion</td>
           <td><a href="https://www.libreoffice.org/download">libreoffice.org</a></td></tr>
       <tr><td><b>Ghostscript</b></td>
           <td>Much stronger PDF compression</td>
-          <td><code>brew install ghostscript</code><br>
-              <code>winget install ArtifexSoftware.GhostScript</code></td></tr>
+          <td>brew install ghostscript<br>winget install ArtifexSoftware.GhostScript</td></tr>
     </table>
-    <p class="sub" style="margin-top:16px">The app runs fine without any of
-      these — it detects what's present, shows it in the header, and tells you
-      what you're missing only when you reach for a feature that needs it.</p>
+
+    <div class="note"><b>This page can't run the rest of it.</b> GitHub Pages
+      serves static files only &mdash; there's no Python process behind it, so
+      merge, split, video download and image cropping genuinely cannot work here.
+      QR encoding needs no server, which is the only reason the generator above
+      is real.</div>
   </div>
 </section>
 
-<section>
+<section id="local">
   <div class="wrap">
-    <h2>Why local</h2>
-    <div class="grid">
-      <div class="card"><h4>Nothing is uploaded</h4>
-        <p>The server binds to <code>127.0.0.1</code> and nothing else. Your
-          documents are never transmitted, because there is nowhere to transmit
-          them to.</p></div>
-      <div class="card"><h4>No page limits</h4>
-        <p>No free tiers, watermarks, daily caps or sign-ups. The constraint is
-          your own disk and CPU.</p></div>
-      <div class="card"><h4>It's one file</h4>
-        <p>Read it, audit it, change it. No build step, no framework, no
-          <code>node_modules</code>.</p></div>
-    </div>
+    <span class="lab">why local</span>
+    <h2>Nothing leaves the room.</h2>
+    <dl class="spec">
+      <div class="spec-row"><dt>No upload</dt>
+        <dd>The server binds to <code>127.0.0.1</code> and nothing else. It isn't
+          reachable from your network.</dd></div>
+      <div class="spec-row"><dt>No limits</dt>
+        <dd>No free tier, watermark, daily cap or sign-up. The constraint is your
+          own disk and CPU.</dd></div>
+      <div class="spec-row"><dt>No black box</dt>
+        <dd>One readable file. No build step, no framework, no
+          <code>node_modules</code>.</dd></div>
+    </dl>
   </div>
 </section>
 
 <footer>
   <div class="wrap">
-    Multi Toolkit — MIT licensed. QR rendering on this page uses
+    MIT licensed. QR rendering on this page uses
     <a href="https://github.com/kazuhikoarase/qrcode-generator">qrcode-generator</a>
-    by Kazuhiko Arase (MIT). "QR Code" is a registered trademark of DENSO WAVE
-    INCORPORATED.
+    by Kazuhiko Arase (MIT). &ldquo;QR Code&rdquo; is a registered trademark of
+    DENSO WAVE INCORPORATED. Only download video you own or have permission to
+    save.
   </div>
 </footer>
 
@@ -428,6 +542,15 @@ python multi_toolkit.py</code></pre>
     });
   }
 
+  /* ---------- the readout ---------- */
+  function setReadout(state, cells){
+    var el = $('readout');
+    el.dataset.state = state;
+    el.innerHTML = cells.map(function(c){
+      return '<span class="ro-cell"><b>' + c[1] + '</b><i>' + c[0] + '</i></span>';
+    }).join('');
+  }
+
   /* ---------- colour helpers ---------- */
   function hexRgb(h){
     h = String(h || '').replace('#','');
@@ -488,7 +611,7 @@ python multi_toolkit.py</code></pre>
     if (!data){
       cv.width = cv.height = 512;
       ctx.clearRect(0,0,512,512);
-      $('stat').textContent = 'Type something to begin';
+      setReadout('idle', [['qr code','awaiting input']]);
       $('warn').textContent = '';
       $('dl').disabled = true;
       return;
@@ -502,8 +625,9 @@ python multi_toolkit.py</code></pre>
     if (border > 16) border = 16;
 
     if (typeof qrcode !== 'function'){
-      $('stat').textContent = 'QR library failed to load — check vendor/qrcode.js';
-      $('warn').textContent = '';
+      setReadout('idle', [['error','qr library did not load']]);
+      $('warn').textContent = 'Check that vendor/qrcode.js was published '
+        + 'alongside this page.';
       $('dl').disabled = true;
       return;
     }
@@ -514,8 +638,8 @@ python multi_toolkit.py</code></pre>
       qr.addData(data);
       qr.make();
     } catch(e){
-      $('stat').textContent = 'Too much data for one QR code — shorten it.';
-      $('warn').textContent = '';
+      setReadout('idle', [['payload','too much for one code']]);
+      $('warn').textContent = 'Shorten the text, or lower the correction level.';
       $('dl').disabled = true;
       return;
     }
@@ -533,6 +657,7 @@ python multi_toolkit.py</code></pre>
     var fg = $('fg').value, bg = $('bg').value;
     if (!transparent){ ctx.fillStyle = bg; ctx.fillRect(0, 0, size, size); }
 
+    var covered = 0;
     var style = $('style').value;
     ctx.fillStyle = fg;
     // Finder patterns stay square whatever the module style — scanners lock
@@ -580,7 +705,7 @@ python multi_toolkit.py</code></pre>
         ? silhouette(logoImg, lw, lh, fg) : logoImg;
       ctx.drawImage(src, Math.round(cx - lw/2), Math.round(cy - lh/2), lw, lh);
 
-      var covered = (lw * lh) / (codePx * codePx) * 100;
+      covered = (lw * lh) / (codePx * codePx) * 100;
       if (covered > 25)
         warn.push('Logo covers ~' + Math.round(covered) + '% of the code — above ' +
                   '~25% some scanners start to struggle.');
@@ -597,8 +722,13 @@ python multi_toolkit.py</code></pre>
       warn.push('Light code on a dark background — some older scanners only ' +
                 'read dark-on-light.');
 
-    $('stat').textContent = mods + '×' + mods + ' modules · EC ' + ec + ' · ' +
-      size + ' px · ' + data.length + ' chars';
+    var cells = [['version','v' + ((mods - 17) / 4)],
+                 ['grid', mods + '×' + mods],
+                 ['correction','EC-' + ec],
+                 ['output', size + ' px'],
+                 ['payload', data.length + ' ch']];
+    if (covered) cells.push(['logo', Math.round(covered) + '%']);
+    setReadout('live', cells);
     $('warn').textContent = warn.join(' ');
     $('dl').disabled = false;
   }
