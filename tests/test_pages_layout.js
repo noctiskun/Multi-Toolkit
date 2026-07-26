@@ -19,12 +19,18 @@ function copy(src, dst) {
 // Layout B — Pages publishes the repo root: index.html at top, vendor under docs/.
 function buildLayout(kind) {
   const base = fs.mkdtempSync('/tmp/pages-' + kind + '-');
-  copy(path.join(ROOT, 'docs', 'index.html'), path.join(base, 'index.html'));
-  const vendorDir = kind === 'docs-folder'
-    ? path.join(base, 'vendor')
-    : path.join(base, 'docs', 'vendor');
-  for (const f of ['qrcode.js', 'qrcode_UTF8.js']) {
-    copy(path.join(ROOT, 'docs', 'vendor', f), path.join(vendorDir, f));
+  if (kind === 'docs-folder') {
+    // Pages publishes /docs: index.html and vendor/ sit side by side.
+    copy(path.join(ROOT, 'docs', 'index.html'), path.join(base, 'index.html'));
+    for (const f of ['qrcode.js', 'qrcode_UTF8.js'])
+      copy(path.join(ROOT, 'docs', 'vendor', f), path.join(base, 'vendor', f));
+  } else {
+    // Pages publishes the repo root: the root stub redirects into docs/.
+    copy(path.join(ROOT, 'index.html'), path.join(base, 'index.html'));
+    copy(path.join(ROOT, 'docs', 'index.html'), path.join(base, 'docs', 'index.html'));
+    for (const f of ['qrcode.js', 'qrcode_UTF8.js'])
+      copy(path.join(ROOT, 'docs', 'vendor', f),
+           path.join(base, 'docs', 'vendor', f));
   }
   return base;
 }
@@ -62,12 +68,21 @@ function check(label, cond, detail) {
 }
 
 (async () => {
-  for (const kind of ['docs-folder', 'repo-root']) {
-    const dir = buildLayout(kind);
+  for (const kind of ['docs-folder', 'repo-root-with-stub']) {
+    const dir = buildLayout(kind === 'docs-folder' ? 'docs-folder' : 'root');
     const { srv, requested, port } = await serve(dir);
     console.log(`\n== Pages publishing the ${kind} ==`);
     try {
-      const dom = await load(`http://127.0.0.1:${port}/`);
+      let dom = await load(`http://127.0.0.1:${port}/`);
+      await new Promise(r => setTimeout(r, 400));
+      // The root stub redirects; jsdom does not follow meta-refresh, so do it.
+      const meta = dom.window.document.querySelector('meta[http-equiv="refresh"]');
+      if (meta) {
+        check('root stub points at docs/', /url=\.\/docs\//.test(meta.content),
+              meta.content);
+        dom.window.close();
+        dom = await load(`http://127.0.0.1:${port}/docs/`);
+      }
       await new Promise(r => setTimeout(r, 900));
       const w = dom.window, $ = id => w.document.getElementById(id);
 

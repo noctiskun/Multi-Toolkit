@@ -140,13 +140,18 @@ The QR generator is the one exception, because QR encoding needs no server at al
 
 ### Publishing it
 
-**Settings → Pages → Source: `main` branch, `/docs` folder.** No workflow file, no build step. The QR library is vendored in `docs/vendor/`, so the page has no external dependencies.
+**Settings → Pages → Build and deployment → Source: "Deploy from a branch" → Branch `main`, folder `/docs` → Save.** No workflow file, no build step.
 
-If Pages is instead publishing the **repo root**, the page still works — it looks for the library at `vendor/qrcode.js` first and falls back to `docs/vendor/qrcode.js`. Both layouts are covered by `tests/test_pages_layout.js`.
+If Pages is publishing the **repo root** instead, the root `index.html` is a small redirect into `docs/`, so the site still works. It is a pointer, not a second copy — there is only ever one real page, at `docs/index.html`.
 
-What *will* break it is publishing the root while `docs/` is missing, or copying `index.html` to the root without its `vendor/` folder. If the page shows **"qr library did not load"**, open your browser's Network tab and look for a 404 on `qrcode.js` — the path it asked for tells you which layout Pages thinks it has.
+Two symptoms and what they mean:
 
-Keep one copy of `index.html` (in `docs/`) rather than one at the root as well. Two copies drift apart, and only one of them is the page anyone sees.
+| What you see | What it means |
+|---|---|
+| Your README, rendered with a blue heading and a Contents list | Pages is publishing the root and found no `index.html` there, so Jekyll rendered `README.md` instead. Switch the source to `/docs`. |
+| The page loads but says **"qr library did not load"** | `qrcode.js` 404'd. Open the Network tab and check the path it asked for — that tells you which folder Pages thinks it is serving. |
+
+Both arrangements are covered by `tests/test_pages_layout.js`, which serves the page over real HTTP in each and checks a code actually renders.
 
 ---
 
@@ -189,9 +194,11 @@ python multi_toolkit.py
 ```
 multi_toolkit.py        the entire application — server, engines and UI
 requirements.txt        optional pre-install of the Python dependencies
+index.html              redirect stub, used only if Pages publishes the root
 docs/
-  index.html            GitHub Pages landing page + live QR generator
+  index.html            the project page + live QR generator
   vendor/qrcode.js      vendored QR library (MIT, Kazuhiko Arase)
+tests/                  five suites — see tests/README.md
 LICENSE
 README.md
 ```
