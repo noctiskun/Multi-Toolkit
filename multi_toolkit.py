@@ -13,6 +13,17 @@ PDF
                  or click pages to extract them; plus every-page / every-N /
                  text ranges / reorder
   • Compress   — lossless cleanup, or strong image recompression/downscaling
+  • PDF → MD   — Markdown for pasting into an LLM: text stays text (a fraction
+                 of the tokens a PDF costs), figures are CROPPED to their own
+                 bounding box and anchored at the point in the reading order
+                 where they occur, each above its own caption. Column-aware for
+                 one, two and three-column layouts. Tables become real Markdown
+                 tables, display equations are fenced in $$, running heads are
+                 dropped. A page with no text layer is exported whole and
+                 flagged rather than silently mangled. Every .md opens with a
+                 short note explaining its own layout, so it can be handed to a
+                 model with no covering message. Also available headless:
+                     python multi_toolkit.py md <pdf-or-folder> [outdir]
   • Convert    — Office → PDF (Word/PowerPoint/Excel)   [needs LibreOffice]
                  PDF → Word (.docx)
                  PDF → PowerPoint (.pptx, page-image slides)
@@ -58,7 +69,7 @@ Dependencies
 Core (always): pypdf — auto-installed on first run.
 Installed automatically the first time a feature needs them (pip wheels, no
 system tools required): pypdfium2, python-pptx, pdf2docx, pikepdf, Pillow,
-yt-dlp, qrcode.
+yt-dlp, qrcode, PyMuPDF.
 
 LibreOffice (OPTIONAL, only for Office→PDF): the one piece that can't be a pip
 wheel. Free, cross-platform. If it's missing the app still runs and tells you
@@ -85,6 +96,7 @@ import re
 import shutil
 import socket
 import subprocess
+import time
 import sys
 import tempfile
 import threading
@@ -1358,6 +1370,906 @@ def op_img_fetch(url):
 
 
 # --------------------------------------------------------------------------- #
+#  PDF -> Markdown  (token-lean output for LLMs, with figures kept accurate)
+#
+#  The goal is not "a picture of the paper". It is: text stays text (cheap),
+#  figures become cropped images anchored exactly where they occur in the
+#  reading order, and anything we cannot read confidently is escalated to a
+#  page image rather than silently mangled.
+# --------------------------------------------------------------------------- #
+
+fitz = None                 # bound by _md_init(); helpers are testable alone
+
+
+def _md_init():
+    """Import PyMuPDF once and publish it to this module's globals."""
+    global fitz
+    if fitz is None:
+        fitz = need("PyMuPDF", "fitz")
+    return fitz
+
+
+_MD_BODY_TOL = 0.6          # font pt within this of the mode counts as body text
+_MD_FURNITURE_HITS = 0.6    # a line repeating on >=60% of pages is header/footer
+_MD_FIG_GAP = 14            # pt: drawings closer than this merge into one figure
+_MD_FIG_MIN_AREA = 0.012    # ignore vector specks below this fraction of a page
+_MD_CAP_GAP = 74            # pt: how far from a figure a caption may sit
+_MD_MATH = "∑∏∫√≤≥≠≈±×÷αβγδθλμσφω∂∇∈∉⊂⊆∪∩→⇒↔∞"
+
+_CAP_RE = re.compile(
+    r"^\s*(Figure|Fig\.?|Table|Chart|Algorithm|Listing|Scheme|Exhibit)\s*"
+    r"([0-9]+(?:\.[0-9]+)?|[IVXLC]+|[A-Z])\s*[.:\u2014-]?\s*", re.I)
+_NUM_HEAD_RE = re.compile(
+    r"^\s*((?:[0-9]+\.){0,3}[0-9]+|[IVXLC]+\.|Appendix\s+[A-Z])\s+\S")
+_WORD_HEAD_RE = re.compile(
+    r"^\s*(abstract|introduction|background|related work|method(?:s|ology)?|"
+    r"approach|experiment(?:s|al setup)?|evaluation|results?|discussion|"
+    r"conclusions?|future work|references|bibliography|acknowledg(?:e)?ments?|"
+    r"appendix)\s*$", re.I)
+_FOOT_RE = re.compile(r"^\s*[\u00b9\u00b2\u00b3\u2070-\u209f\*\u2020\u2021]|^\s*\[?\d{1,2}[\].]\s")
+
+
+def _md_spans(page):
+    """Flat list of text spans with geometry. One dict per span, reading-agnostic."""
+    out = []
+    d = page.get_text("dict")
+    for blk in d.get("blocks", []):
+        if blk.get("type") != 0:
+            continue
+        for line in blk.get("lines", []):
+            for sp in line.get("spans", []):
+                t = sp.get("text", "")
+                if not t.strip():
+                    continue
+                out.append({
+                    "text": t, "size": round(sp.get("size", 0), 1),
+                    "font": sp.get("font", ""), "flags": sp.get("flags", 0),
+                    "bbox": fitz.Rect(sp["bbox"]),
+                    "line": tuple(round(v, 1) for v in line["bbox"]),
+                })
+    return out
+
+
+def _md_lines(spans):
+    """Group spans back into visual lines, preserving their order on the line."""
+    by = {}
+    for sp in spans:
+        by.setdefault(sp["line"], []).append(sp)
+    lines = []
+    for key, group in by.items():
+        group.sort(key=lambda s: s["bbox"].x0)
+        r = fitz.Rect(group[0]["bbox"])
+        for s in group[1:]:
+            r |= s["bbox"]
+        text = "".join(s["text"] for s in group)
+        sizes = {}
+        for s in group:
+            sizes[s["size"]] = sizes.get(s["size"], 0) + len(s["text"])
+        lines.append({
+            "text": _md_tidy(text), "bbox": r,
+            "size": max(sizes, key=sizes.get) if sizes else 0,
+            "bold": any("bold" in s["font"].lower() or (s["flags"] & 16)
+                        for s in group),
+            "italic": any("italic" in s["font"].lower() or "it" in s["font"].lower()
+                          or (s["flags"] & 2) for s in group),
+            "spans": group,
+        })
+    lines.sort(key=lambda l: (round(l["bbox"].y0, 1), l["bbox"].x0))
+    return lines
+
+
+def _md_tidy(s):
+    s = s.replace("\ufb00", "ff").replace("\ufb01", "fi").replace("\ufb02", "fl")
+    s = s.replace("\ufb03", "ffi").replace("\ufb04", "ffl")
+    s = s.replace("\u00ad", "").replace("\u2010", "-")
+    return re.sub(r"[ \t]+", " ", s).strip()
+
+
+def _md_body_size(pages_lines):
+    """The most common font size, weighted by characters — that is body text."""
+    tally = {}
+    for lines in pages_lines:
+        for l in lines:
+            tally[l["size"]] = tally.get(l["size"], 0) + len(l["text"])
+    return max(tally, key=tally.get) if tally else 10.0
+
+
+def _md_furniture(pages_lines, page_rects, body_size=None):
+    """Running headers/footers: same small text, same band, on most pages.
+
+    Size matters: a paper's running head is often the title verbatim, so
+    without the size guard the real title gets deleted from page one.
+    """
+    if len(pages_lines) < 3:
+        return set()
+    seen = {}
+    for lines, rect in zip(pages_lines, page_rects):
+        top, bot = rect.height * 0.08, rect.height * 0.92
+        for l in lines:
+            if body_size and l["size"] > body_size + 1.0:
+                continue
+            if l["bbox"].y1 <= top or l["bbox"].y0 >= bot:
+                key = re.sub(r"\d+", "#", l["text"])[:70]
+                if key:
+                    seen.setdefault(key, set()).add(id(lines))
+    need = max(2, int(len(pages_lines) * _MD_FURNITURE_HITS))
+    return {k for k, v in seen.items() if len(v) >= need}
+
+
+def _md_columns(lines, rect):
+    """Find column gutters by projecting text onto the x-axis and looking for
+    vertical bands that no ordinary line occupies.
+
+    Generalises to any column count: journals use two, some proceedings use
+    three, and most documents use one. A few things legitimately span the
+    gutters — the title, a full-width figure — so those are excluded from the
+    projection rather than treated as counter-evidence.
+    """
+    if len(lines) < 8:
+        return []
+    wide = rect.width * 0.55
+    body = [l for l in lines if l["bbox"].width < wide]
+    if len(body) < 6:
+        return []
+
+    step = 3.0
+    nbin = max(8, int(rect.width / step) + 1)
+    hits = [0] * nbin
+    for l in body:
+        a = max(0, int((l["bbox"].x0 - rect.x0) / step))
+        b = min(nbin - 1, int((l["bbox"].x1 - rect.x0) / step))
+        for i in range(a, b + 1):
+            hits[i] += 1
+
+    # Ignore the outer margins; we only care about gaps between text blocks.
+    used = [i for i, h in enumerate(hits) if h]
+    if not used:
+        return []
+    lo, hi = used[0], used[-1]
+
+    gaps, run = [], None
+    for i in range(lo, hi + 1):
+        if hits[i] == 0:
+            run = i if run is None else run
+        elif run is not None:
+            gaps.append((run, i - 1))
+            run = None
+    min_gap = max(8.0, rect.width * 0.018)
+    cuts = []
+    for a, b in gaps:
+        if (b - a + 1) * step < min_gap:
+            continue
+        x = rect.x0 + (a + b + 1) / 2 * step
+        left = sum(1 for l in body if l["bbox"].x1 <= x)
+        right = sum(1 for l in body if l["bbox"].x0 >= x)
+        if left >= 3 and right >= 3:
+            cuts.append(x)
+    if len(cuts) > 4:                       # implausible; treat as one column
+        return []
+    return sorted(cuts)
+
+
+def _md_order(lines, rect, cuts):
+    """Reading order. With columns, read each column fully before moving to the
+    next; anything spanning a gutter (title, wide figure, full-width table) acts
+    as a horizontal barrier that resets the column sweep beneath it."""
+    if not cuts:
+        return sorted(lines, key=lambda l: (round(l["bbox"].y0, 1), l["bbox"].x0))
+
+    edges = [rect.x0 - 1] + list(cuts) + [rect.x1 + 1]
+
+    def col_of(l):
+        """Which column a line belongs to, or None if it spans a gutter."""
+        for c in cuts:
+            if l["bbox"].x0 < c - 6 and l["bbox"].x1 > c + 6:
+                return None
+        mid = (l["bbox"].x0 + l["bbox"].x1) / 2
+        for i in range(len(edges) - 1):
+            if edges[i] <= mid < edges[i + 1]:
+                return i
+        return 0
+
+    spanning = [l for l in lines if col_of(l) is None]
+    bands, prev = [], rect.y0 - 1
+    for l in sorted(spanning, key=lambda l: l["bbox"].y0):
+        if l["bbox"].y0 - prev > 4:
+            bands.append((prev, l["bbox"].y0))
+        bands.append((l["bbox"].y0, l["bbox"].y1))
+        prev = l["bbox"].y1
+    bands.append((prev, rect.y1 + 1))
+
+    out, placed = [], set()
+    for y0, y1 in bands:
+        here = [l for l in lines
+                if y0 <= l["bbox"].y0 < y1 and id(l) not in placed]
+        if not here:
+            continue
+        span_here = [l for l in here if col_of(l) is None]
+        if span_here:
+            for l in sorted(span_here, key=lambda l: l["bbox"].y0):
+                out.append(l)
+                placed.add(id(l))
+            continue
+        for ci in range(len(edges) - 1):
+            col = [l for l in here if col_of(l) == ci]
+            for l in sorted(col, key=lambda l: (round(l["bbox"].y0, 1),
+                                                l["bbox"].x0)):
+                out.append(l)
+                placed.add(id(l))
+    for l in lines:                      # nothing may be dropped
+        if id(l) not in placed:
+            out.append(l)
+    return out
+
+
+def _md_cluster_rects(rects, gap):
+    """Merge rectangles that touch or nearly touch into connected groups."""
+    boxes = [fitz.Rect(r) for r in rects]
+    merged = True
+    while merged and boxes:
+        merged = False
+        for i in range(len(boxes)):
+            for j in range(i + 1, len(boxes)):
+                a, b = boxes[i], boxes[j]
+                grown = fitz.Rect(a.x0 - gap, a.y0 - gap, a.x1 + gap, a.y1 + gap)
+                if grown.intersects(b):
+                    boxes[i] = a | b
+                    boxes.pop(j)
+                    merged = True
+                    break
+            if merged:
+                break
+    return boxes
+
+
+def _md_table_regions(page):
+    """Table regions from ruling geometry: horizontal rules or a cell grid."""
+    hlines, cells = [], []
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return []
+    for d in drawings:
+        r = fitz.Rect(d["rect"])
+        for item in d.get("items", []):
+            if item[0] == "l":
+                if abs(item[1].y - item[2].y) < 1.2 and abs(item[1].x - item[2].x) > 28:
+                    hlines.append(fitz.Rect(min(item[1].x, item[2].x), item[1].y - .6,
+                                            max(item[1].x, item[2].x), item[1].y + .6))
+            elif item[0] == "re":
+                rr = fitz.Rect(item[1])
+                if rr.width > 18 and 6 < rr.height < 46:
+                    cells.append(rr)
+                elif rr.height < 1.5 and rr.width > 28:
+                    hlines.append(rr)
+
+    regions = []
+    if len(cells) >= 4:                       # full cell grid (Word-style)
+        for box in _md_cluster_rects(cells, 3):
+            inside = [c for c in cells if box.intersects(c)]
+            if len(inside) >= 4:
+                regions.append(box)
+    if len(hlines) >= 2:                      # booktabs-style rules
+        for box in _md_cluster_rects(hlines, 46):
+            rules = [h for h in hlines if box.intersects(h)]
+            if len(rules) >= 2 and box.height > 12:
+                if not any(box.intersects(r) and (box & r).get_area() >
+                           0.5 * box.get_area() for r in regions):
+                    regions.append(box)
+    return regions
+
+
+def _md_table_from(region, lines):
+    """Cluster the text inside a region into rows and columns.
+
+    Works for both ruled grids and horizontal-rule-only tables, because it
+    keys off where the text actually sits rather than the ruling style.
+    """
+    inner = [l for l in lines
+             if region.intersects(l["bbox"])
+             and (region & l["bbox"]).get_area() > 0.45 * l["bbox"].get_area()]
+    if len(inner) < 4:
+        return None
+
+    rows = []                                  # cluster by vertical overlap
+    for l in sorted(inner, key=lambda l: l["bbox"].y0):
+        placed = False
+        for row in rows:
+            if abs(row[0]["bbox"].y0 - l["bbox"].y0) < max(4, l["bbox"].height * 0.6):
+                row.append(l)
+                placed = True
+                break
+        if not placed:
+            rows.append([l])
+    rows = [sorted(r, key=lambda l: l["bbox"].x0) for r in rows]
+    rows = [r for r in rows if r]
+    if len(rows) < 2:
+        return None
+
+    # Column edges: the set of distinct left-edges across all rows.
+    edges = []
+    for r in rows:
+        for c in r:
+            x = c["bbox"].x0
+            if not any(abs(x - e) < 12 for e in edges):
+                edges.append(x)
+    edges.sort()
+    if len(edges) < 2:
+        return None
+
+    grid = []
+    for r in rows:
+        cells = [""] * len(edges)
+        for c in r:
+            idx = min(range(len(edges)),
+                      key=lambda i: abs(edges[i] - c["bbox"].x0))
+            cells[idx] = (cells[idx] + " " + c["text"]).strip()
+        grid.append(cells)
+
+    filled = sum(1 for row in grid for c in row if c)
+    if filled < len(edges) * 1.5 or filled / (len(grid) * len(edges)) < 0.35:
+        return None
+    return grid
+
+
+def _md_grid_to_md(grid):
+    w = len(grid[0])
+    def esc(c):
+        return c.replace("|", "\\|")
+    out = ["| " + " | ".join(esc(c) for c in grid[0]) + " |",
+           "|" + "|".join(["---"] * w) + "|"]
+    for row in grid[1:]:
+        out.append("| " + " | ".join(esc(c) for c in row) + " |")
+    return out
+
+
+def _md_figure_regions(page, table_regions):
+    """Figure regions: clustered vector art, plus placed raster images."""
+    parea = page.rect.get_area() or 1
+    boxes, kinds = [], []
+
+    raw = []
+    try:
+        for d in page.get_drawings():
+            r = fitz.Rect(d["rect"])
+            if r.is_empty or r.width < 4 or r.height < 4:
+                continue
+            if r.get_area() > 0.92 * parea:          # page border / background
+                continue
+            if any(t.intersects(r) and (t & r).get_area() > 0.6 * r.get_area()
+                   for t in table_regions):
+                continue
+            raw.append(r)
+    except Exception:
+        raw = []
+    for box in _md_cluster_rects(raw, _MD_FIG_GAP):
+        members = [r for r in raw if box.intersects(r)]
+        if len(members) >= 3 and box.get_area() / parea >= _MD_FIG_MIN_AREA:
+            boxes.append(box)
+            kinds.append("vector")
+
+    try:
+        for im in page.get_images(full=True):
+            for r in page.get_image_rects(im[0]):
+                if r.get_area() / parea < 0.02:      # logos, rules, bullets
+                    continue
+                merged = False
+                for i, b in enumerate(boxes):
+                    if b.intersects(r) and (b & r).get_area() > 0.5 * min(
+                            b.get_area(), r.get_area()):
+                        boxes[i] = b | r
+                        kinds[i] = "mixed"
+                        merged = True
+                        break
+                if not merged:
+                    boxes.append(fitz.Rect(r))
+                    kinds.append("raster")
+    except Exception:
+        pass
+    return list(zip(boxes, kinds))
+
+
+def _md_same_column(box, x0, x1):
+    """Does this block sit in the column the reader is currently in?"""
+    if x1 >= 1e8:                      # end-of-page sweep: anything goes
+        return True
+    overlap = min(box.x1, x1) - max(box.x0, x0)
+    return overlap > min(box.width, max(1.0, x1 - x0)) * 0.35
+
+
+def _md_bind_caption(box, lines, page_rect, avoid=None):
+    """Find the caption for a figure/table region.
+
+    Figure captions usually sit below, table captions above, so both are
+    searched — nearest wins, and only text that actually looks like a caption
+    is accepted.
+    """
+    best, best_d = None, 1e9
+    for l in lines:
+        m = _CAP_RE.match(l["text"])
+        if not m:
+            continue
+        lb = l["bbox"]
+        overlap = min(lb.x1, box.x1) - max(lb.x0, box.x0)
+        if overlap < min(lb.width, box.width) * 0.25:
+            continue
+        if lb.y0 >= box.y1:
+            d = lb.y0 - box.y1
+        elif lb.y1 <= box.y0:
+            d = box.y0 - lb.y1
+        else:
+            d = 0
+        if d < best_d and d <= _MD_CAP_GAP:
+            best, best_d = l, d
+    if not best:
+        return None, None, []
+    m = _CAP_RE.match(best["text"])
+    label = f"{m.group(1).rstrip('.').title()} {m.group(2)}"
+    # Caption text may wrap onto following lines.
+    parts, taken = [best["text"]], [best]
+    for l in lines:
+        if l is best:
+            continue
+        if avoid is not None and avoid.intersects(l["bbox"]) and \
+                (avoid & l["bbox"]).get_area() > 0.45 * l["bbox"].get_area():
+            continue
+        if (abs(l["bbox"].x0 - best["bbox"].x0) < 14
+                and 0 <= l["bbox"].y0 - best["bbox"].y1 < best["bbox"].height * 1.9
+                and l["size"] <= best["size"] + 0.4
+                and not _CAP_RE.match(l["text"])):
+            parts.append(l["text"])
+            taken.append(l)
+            best = l
+    return label, _md_tidy(" ".join(parts)), taken
+
+
+def _md_is_equation(line, body_size):
+    t = line["text"]
+    if not t or len(t) > 190:
+        return False
+    if any(ch in t for ch in _MD_MATH):
+        letters = sum(ch.isalpha() for ch in t)
+        return letters < len(t) * 0.72
+    if re.match(r"^\s*\(\d+\)\s*$", t):
+        return False
+    if line["italic"] and re.search(r"[=<>≤≥]", t) and len(t) < 90:
+        return True
+    return False
+
+
+def _md_heading(line, body_size):
+    """Heading level, or 0. Size and weight beat pattern matching, but a
+    numbered or well-known section name counts even when the size is subtle."""
+    t = line["text"]
+    if not t or len(t) > 120 or t.endswith((".", ",", ";")) and not _NUM_HEAD_RE.match(t):
+        if not _WORD_HEAD_RE.match(t):
+            return 0
+    big = line["size"] - body_size
+    if big >= 5:
+        return 1
+    if big >= 2.2:
+        return 2
+    if big >= 0.9 or line["bold"]:
+        if _NUM_HEAD_RE.match(t) or _WORD_HEAD_RE.match(t) or line["size"] > body_size:
+            depth = t.count(".") if _NUM_HEAD_RE.match(t) else 0
+            return min(4, 2 + depth) if depth else 2
+    if _WORD_HEAD_RE.match(t) and len(t) < 40:
+        return 2
+    return 0
+
+
+def _md_slug(name):
+    s = re.sub(r"[^\w\-]+", "_", os.path.splitext(os.path.basename(name))[0])
+    return (s.strip("_") or "document")[:48]
+
+
+def op_pdf2md(raw, name="document.pdf", dpi=170, want_images=True,
+              want_tables=True, want_math=True, want_pages=True,
+              want_header=True, crop_pad=7, max_figs=120, page_from=None,
+              page_to=None):
+    """Convert a PDF to Markdown, returning (files, summary_dict).
+
+    files: list of (filename, bytes) — the .md plus any figure crops.
+    """
+    _md_init()
+    try:
+        doc = fitz.open(stream=raw, filetype="pdf")
+    except Exception as e:                                    # noqa: BLE001
+        raise FeatureError(f"Could not open that PDF: {e}")
+    if doc.needs_pass:
+        raise FeatureError("That PDF is password-protected.")
+
+    stem = _md_slug(name)
+    first = max(1, int(page_from or 1))
+    last = min(doc.page_count, int(page_to or doc.page_count))
+    if first > last:
+        raise FeatureError(f"Page range {first}-{last} is empty.")
+    idx = list(range(first - 1, last))
+
+    pages_lines, page_rects = [], []
+    for i in idx:
+        page = doc[i]
+        pages_lines.append(_md_lines(_md_spans(page)))
+        page_rects.append(page.rect)
+
+    body_size = _md_body_size(pages_lines)
+    furniture = _md_furniture(pages_lines, page_rects, body_size)
+
+    out, files, figures, warnings = [], [], [], []
+    nfig = 0
+    stats = {"pages": len(idx), "figures": 0, "tables": 0, "equations": 0,
+             "page_images": 0, "chars": 0, "low_confidence": []}
+
+    for n, (i, lines, rect) in enumerate(zip(idx, pages_lines, page_rects), 1):
+        page = doc[i]
+        pno = i + 1
+        body = [l for l in lines
+                if l["size"] > body_size + 1.0
+                or re.sub(r"\d+", "#", l["text"])[:70] not in furniture]
+        chars = sum(len(l["text"]) for l in body)
+
+        table_regions = _md_table_regions(page) if want_tables else []
+        fig_regions = _md_figure_regions(page, table_regions) if want_images else []
+
+        # --- a page with no readable text is a scan: image is the only truth
+        if chars < 40:
+            if want_pages and want_images:
+                pix = page.get_pixmap(dpi=dpi)
+                fn = f"{stem}_p{pno:03d}.png"
+                files.append((fn, pix.tobytes("png")))
+                out += [f"<!-- page {pno}: no text layer; full page image -->",
+                        f"![Page {pno} (scanned — no text layer)]({fn})", ""]
+                stats["page_images"] += 1
+                figures.append({"page": pno, "file": fn, "label": None,
+                                "kind": "page-scan", "caption": None})
+            else:
+                out += [f"<!-- page {pno}: no text layer, image export off -->", ""]
+            stats["low_confidence"].append(pno)
+            continue
+
+        consumed = set()          # lines already emitted as caption or table
+
+        # --- tables ------------------------------------------------------
+        tables = []
+        for reg in table_regions:
+            grid = _md_table_from(reg, body)
+            if not grid:
+                continue
+            label, cap, cap_lines = _md_bind_caption(reg, body, rect, avoid=reg)
+            tables.append({"rect": reg, "grid": grid, "label": label,
+                           "caption": cap})
+            for l in cap_lines:
+                consumed.add(id(l))
+            for l in body:
+                if reg.intersects(l["bbox"]) and (reg & l["bbox"]).get_area() > \
+                        0.45 * l["bbox"].get_area():
+                    consumed.add(id(l))
+
+        # --- figures -----------------------------------------------------
+        figs = []
+        for reg, kind in fig_regions:
+            if nfig >= max_figs:
+                warnings.append(f"figure cap ({max_figs}) reached at page {pno}")
+                break
+            if any(t["rect"].intersects(reg) and
+                   (t["rect"] & reg).get_area() > 0.6 * reg.get_area()
+                   for t in tables):
+                continue
+            label, cap, cap_lines = _md_bind_caption(reg, body, rect, avoid=reg)
+            for l in cap_lines:
+                consumed.add(id(l))
+            clip = fitz.Rect(reg.x0 - crop_pad, reg.y0 - crop_pad,
+                             reg.x1 + crop_pad, reg.y1 + crop_pad) & page.rect
+            try:
+                pix = page.get_pixmap(dpi=dpi, clip=clip)
+                data = pix.tobytes("png")
+            except Exception:                                 # noqa: BLE001
+                continue
+            nfig += 1
+            fn = f"{stem}_p{pno:03d}_fig{nfig:02d}.png"
+            files.append((fn, data))
+            figs.append({"rect": reg, "file": fn, "label": label,
+                         "caption": cap, "kind": kind})
+            figures.append({"page": pno, "file": fn, "label": label,
+                            "kind": kind, "caption": cap})
+        stats["figures"] += len(figs)
+        stats["tables"] += len(tables)
+
+        # --- flow the page in reading order ------------------------------
+        cuts = _md_columns(body, rect)
+        ordered = _md_order(body, rect, cuts)
+        out.append(f"<!-- page {pno} -->")
+
+        placed_t, placed_f = set(), set()
+        para, last_line = [], None
+
+        def flush():
+            nonlocal out
+            if para:
+                out.append(" ".join(para))
+                out.append("")
+                para.clear()
+
+        def emit_blocks_before(y, x0, x1):
+            """Drop in any figure/table whose top sits above this line."""
+            nonlocal out
+            for ti, t in enumerate(tables):
+                if ti in placed_t or t["rect"].y0 > y:
+                    continue
+                if not _md_same_column(t["rect"], x0, x1):
+                    continue
+                flush()
+                cap = t["caption"] or (f"{t['label']}" if t["label"] else None)
+                if cap:
+                    out += [f"**{cap}**", ""]
+                out += _md_grid_to_md(t["grid"]) + [""]
+                placed_t.add(ti)
+            for fi, f in enumerate(figs):
+                if fi in placed_f or f["rect"].y0 > y:
+                    continue
+                if not _md_same_column(f["rect"], x0, x1):
+                    continue
+                flush()
+                alt = f["label"] or f"Figure on page {pno}"
+                out.append(f"![{alt}]({f['file']})")
+                if f["caption"]:
+                    out += ["", f"*{f['caption']}*"]
+                elif not f["label"]:
+                    out += ["", f"*(unlabelled {f['kind']} figure, page {pno})*"]
+                out.append("")
+                placed_f.add(fi)
+
+        for l in ordered:
+            if id(l) in consumed:
+                continue
+            emit_blocks_before(l["bbox"].y0, l["bbox"].x0, l["bbox"].x1)
+            t = l["text"]
+            if not t:
+                continue
+            lvl = _md_heading(l, body_size)
+            if lvl:
+                flush()
+                out += ["#" * lvl + " " + t, ""]
+                last_line = l
+                continue
+            if want_math and _md_is_equation(l, body_size):
+                flush()
+                out += ["$$", t, "$$", ""]
+                stats["equations"] += 1
+                last_line = l
+                continue
+            if l["size"] < body_size - 1.0 and _FOOT_RE.match(t):
+                flush()
+                note = [t]
+                for nxt in ordered[ordered.index(l) + 1:]:
+                    if (id(nxt) in consumed or nxt["size"] > body_size - 1.0
+                            or abs(nxt["bbox"].x0 - l["bbox"].x0) > 30
+                            or nxt["bbox"].y0 - l["bbox"].y1 > l["bbox"].height * 1.6
+                            or _FOOT_RE.match(nxt["text"])):
+                        break
+                    note.append(nxt["text"])
+                    consumed.add(id(nxt))
+                    l = nxt
+                out += ["> " + " ".join(note), ""]
+                last_line = l
+                continue
+            # Decide the break BEFORE appending: a wide vertical gap, or a jump
+            # to another column, ends the previous paragraph rather than this one.
+            if last_line is not None and para:
+                gap = l["bbox"].y0 - last_line["bbox"].y1
+                jumped = (l["bbox"].y0 < last_line["bbox"].y0 - 2
+                          or abs(l["bbox"].x0 - last_line["bbox"].x0) > 40)
+                if gap > l["bbox"].height * 1.4 or jumped:
+                    flush()
+            # join wrapped lines; a hyphen at end of line means a split word
+            if para and para[-1].endswith("-") and not para[-1].endswith("--"):
+                para[-1] = para[-1][:-1] + t.lstrip()
+            else:
+                para.append(t)
+            last_line = l
+        flush()
+        emit_blocks_before(1e9, 0, 1e9)          # anything left at page end
+        out.append("")
+
+        # --- confidence --------------------------------------------------
+        if want_images and chars < 220 and (figs or fig_regions):
+            stats["low_confidence"].append(pno)
+        stats["chars"] += chars
+
+    doc.close()
+
+    # ------------------------------------------------------------------ #
+    #  Escalate genuinely unreliable pages to a full page image.
+    # ------------------------------------------------------------------ #
+    body_md = "\n".join(out)
+    body_md = re.sub(r"\n{3,}", "\n\n", body_md).strip() + "\n"
+
+    head = []
+    if want_header:
+        head = _md_header(name, stem, stats, figures, len(idx), first, last)
+    md = ("\n".join(head) + "\n" + body_md) if head else body_md
+    files.insert(0, (f"{stem}.md", md.encode("utf-8")))
+
+    summary = dict(stats)
+    summary.update({
+        "stem": stem, "md_name": f"{stem}.md", "images": len(files) - 1,
+        "md_bytes": len(md.encode()), "figure_list": figures,
+        "warnings": warnings,
+    })
+    return files, summary
+
+
+def _md_header(name, stem, stats, figures, npages, first, last):
+    """A short self-describing preamble, so the file needs no covering note."""
+    rng = "" if (first == 1 and last == npages + first - 1) else \
+        f", pages {first}-{last}"
+    h = [f"# {os.path.splitext(os.path.basename(name))[0]}", "",
+         "> **How to read this file.** It was converted from a PDF"
+         f" (`{os.path.basename(name)}`{rng}).",
+         "> Text is real extracted text. Images are cropped from the page and"
+         " appear at the point",
+         "> in the reading order where they occur, so the figure above a caption"
+         " is the figure that",
+         "> caption describes. `<!-- page N -->` marks where each PDF page"
+         " begins."]
+    if stats["figures"] or stats["page_images"]:
+        h.append(f"> Figures are separate PNG files next to this one"
+                 f" (`{stem}_pNNN_figNN.png`); keep them together.")
+    if stats["low_confidence"]:
+        pages = ", ".join(str(p) for p in stats["low_confidence"][:14])
+        more = "…" if len(stats["low_confidence"]) > 14 else ""
+        h.append(f"> **Lower confidence on page(s) {pages}{more}** — little or no"
+                 " extractable text there, so trust the image over the text.")
+    h.append("")
+    return h
+
+
+def op_pdf2md_job(got, data):
+    """Adapter: run a conversion and shape it for the download endpoint."""
+    files, summary = op_pdf2md(
+        got["bytes"], got["name"],
+        dpi=int(data.get("dpi", 170)),
+        want_images=bool(data.get("images", True)),
+        want_tables=bool(data.get("tables", True)),
+        want_math=bool(data.get("math", True)),
+        want_header=bool(data.get("header", True)),
+        page_from=data.get("page_from"), page_to=data.get("page_to"))
+    if data.get("index"):
+        entry = {"source": got["name"],
+                 **{k: summary[k] for k in ("md_name", "pages", "figures",
+                                            "tables", "page_images",
+                                            "low_confidence", "images")}}
+        files.append(("_INDEX.md", md_index([entry]).encode()))
+    bits = [f"{summary['pages']} page(s)", f"{summary['figures']} figure(s)",
+            f"{summary['tables']} table(s)"]
+    if summary["page_images"]:
+        bits.append(f"{summary['page_images']} page image(s)")
+    note = " · ".join(bits) + f" · {summary['md_bytes']/1024:.0f} KB markdown"
+    if summary["low_confidence"]:
+        note += (" · check page(s) "
+                 + ", ".join(map(str, summary["low_confidence"][:8])))
+    return files, note
+
+
+def md_index(entries, title="PDF → Markdown conversion index"):
+    """Optional index for a batch. This is for the human auditing a run — a
+    single converted paper does not need it, because its own header explains
+    itself."""
+    now = time.strftime("%Y-%m-%d %H:%M")
+    out = [f"# {title}", "", f"Generated {now}", "",
+           "| Source | Markdown | Pages | Figures | Tables | Needs eyes |",
+           "|---|---|---|---|---|---|"]
+    weak = []
+    for e in entries:
+        if e.get("error"):
+            out.append(f"| {e['source']} | **failed** | - | - | - | {e['error']} |")
+            continue
+        lc = e.get("low_confidence") or []
+        out.append(
+            f"| {e['source']} | `{e['md_name']}` | {e['pages']} | "
+            f"{e['figures']} | {e['tables']} | "
+            f"{'p' + ', p'.join(map(str, lc)) if lc else '—'} |")
+        if lc:
+            weak.append((e["source"], lc))
+    out += ["", "## Pages worth opening yourself", ""]
+    if weak:
+        for src, lc in weak:
+            out.append(f"- **{src}** — page(s) {', '.join(map(str, lc))}: little or "
+                       "no extractable text, so the image is the only record.")
+    else:
+        out.append("- (none — every page had a usable text layer)")
+    out += ["", "## Reading these files", "",
+            "- Each `.md` opens with a short note explaining its own layout, so it",
+            "  can be handed to an LLM on its own with no covering message.",
+            "- Figures are cropped PNGs beside each `.md`. Keep them in the same",
+            "  folder or the image links break.",
+            "- An image sits at the point in the text where it appears in the PDF,",
+            "  and its caption follows it, so figure and caption cannot be mixed up.",
+            ""]
+    return "\n".join(out)
+
+
+def md_batch(paths, outdir, index=True, **kw):
+    """Convert many PDFs to <outdir>/<stem>/. Returns the list of entries."""
+    entries = []
+    os.makedirs(outdir, exist_ok=True)
+    for path in paths:
+        src = os.path.basename(path)
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read()
+            files, summary = op_pdf2md(raw, src, **kw)
+        except Exception as e:                                # noqa: BLE001
+            entries.append({"source": src, "error": str(e)[:120]})
+            print(f"  {src:40s} FAILED: {str(e)[:60]}")
+            continue
+        sub = os.path.join(outdir, summary["stem"])
+        os.makedirs(sub, exist_ok=True)
+        for fn, data in files:
+            with open(os.path.join(sub, fn), "wb") as fh:
+                fh.write(data)
+        entry = {"source": src, **{k: summary[k] for k in
+                 ("md_name", "pages", "figures", "tables", "page_images",
+                  "low_confidence", "images")}}
+        entries.append(entry)
+        print(f"  {src:40s} {summary['pages']:3d}p  {summary['figures']:2d} fig  "
+              f"{summary['tables']:2d} tbl  -> {summary['stem']}/"
+              f"{'  (check pages ' + ','.join(map(str, summary['low_confidence'])) + ')' if summary['low_confidence'] else ''}")
+    if index:
+        with open(os.path.join(outdir, "_INDEX.md"), "w") as fh:
+            fh.write(md_index(entries))
+    return entries
+
+
+def md_cli(argv):
+    """`python multi_toolkit.py md <pdf-or-folder> [outdir] [options]`"""
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="multi_toolkit.py md",
+        description="Convert PDFs to Markdown with cropped figures, for feeding "
+                    "to an LLM without shipping the whole PDF.")
+    ap.add_argument("src", help="a PDF file, or a folder of PDFs")
+    ap.add_argument("outdir", nargs="?", default="./md_out")
+    ap.add_argument("--dpi", type=int, default=170, help="figure raster dpi")
+    ap.add_argument("--no-images", action="store_true", help="text only")
+    ap.add_argument("--no-tables", action="store_true")
+    ap.add_argument("--no-math", action="store_true")
+    ap.add_argument("--no-header", action="store_true",
+                    help="omit the self-describing preamble")
+    ap.add_argument("--index", action="store_true",
+                    help="also write _INDEX.md summarising the run")
+    ap.add_argument("--pages", metavar="A-B", help="page range, e.g. 3-12")
+    a = ap.parse_args(argv)
+
+    src = os.path.expanduser(a.src)
+    if os.path.isdir(src):
+        paths = sorted(os.path.join(r, f) for r, _d, fs in os.walk(src)
+                       for f in fs if f.lower().endswith(".pdf"))
+        if not paths:
+            sys.exit(f"No PDFs found in {src}")
+    elif os.path.isfile(src):
+        paths = [src]
+    else:
+        sys.exit(f"No such file or folder: {src}")
+
+    pf = pt = None
+    if a.pages:
+        m = re.match(r"^\s*(\d+)\s*[-:]\s*(\d+)\s*$", a.pages)
+        if not m:
+            sys.exit("--pages wants a range like 3-12")
+        pf, pt = int(m.group(1)), int(m.group(2))
+
+    print(f"Converting {len(paths)} PDF(s) -> {a.outdir}")
+    md_batch(paths, os.path.expanduser(a.outdir), index=a.index, dpi=a.dpi,
+             want_images=not a.no_images, want_tables=not a.no_tables,
+             want_math=not a.no_math, want_header=not a.no_header,
+             page_from=pf, page_to=pt)
+    print(f"\nDone -> {a.outdir}")
+    if a.index:
+        print(f"Index: {os.path.join(a.outdir, '_INDEX.md')}")
+
+
+# --------------------------------------------------------------------------- #
 #  HTTP server
 # --------------------------------------------------------------------------- #
 class Handler(BaseHTTPRequestHandler):
@@ -1540,6 +2452,9 @@ class Handler(BaseHTTPRequestHandler):
                 files = resolve_files(data.get("files", []))
                 results = [(f["name"], f["bytes"]) for f in files]
                 info = data.get("info", "Done.")
+            elif self.path == "/pdf2md":
+                got = resolve_files([data.get("file")])
+                results, info = op_pdf2md_job(got[0], data)
             elif self.path == "/img_process":
                 got = resolve_files([data.get("file")])
                 results, info = op_img_process(
@@ -2092,6 +3007,7 @@ input[type=color]{
       <div class="tab" data-tab="split">Split</div>
       <div class="tab" data-tab="compress">Compress</div>
       <div class="tab" data-tab="convert">Convert</div>
+      <div class="tab" data-tab="pdf2md">PDF → MD</div>
     </div>
     <div class="groups">
       <div class="group" data-g="media"><b>Media</b><span>a/v</span></div>
@@ -2249,6 +3165,38 @@ input[type=color]{
         </label>
       </div>
       <div class="ytnote" id="ytNote">Only download videos you own or have permission to save.</div>
+    </div>
+  </div>
+
+  <!-- PDF -> MARKDOWN -->
+  <div id="mdUI" class="hide">
+    <div class="card">
+      <h4>For pasting into an LLM</h4>
+      <p style="margin:0 0 12px;font-size:14px;color:var(--dim);line-height:1.55">
+        Text stays text, so it costs a fraction of the tokens a PDF would.
+        Figures are cropped from the page and dropped in at the point they
+        appear, each next to its own caption. Pages with no text layer are
+        exported whole and flagged, so nothing is silently lost.</p>
+      <div class="opts" style="margin:0">
+        <label><input type="checkbox" id="mdImages" checked> Extract figures</label>
+        <label><input type="checkbox" id="mdTables" checked> Tables as Markdown</label>
+        <label><input type="checkbox" id="mdMath" checked> Equations as LaTeX</label>
+        <label><input type="checkbox" id="mdHeader" checked> Explain-itself header</label>
+        <label><input type="checkbox" id="mdIndex"> Also write _INDEX.md</label>
+        <label>Figure quality
+          <select id="mdDpi">
+            <option value="120">120 dpi — small files</option>
+            <option value="170" selected>170 dpi — balanced</option>
+            <option value="240">240 dpi — dense figures</option>
+            <option value="320">320 dpi — maximum detail</option>
+          </select>
+        </label>
+        <label>Pages
+          <input type="text" id="mdPages" placeholder="all" style="width:82px">
+        </label>
+      </div>
+      <div class="ytnote" id="mdNote">Multiple PDFs convert one after another,
+        each into its own set of files.</div>
     </div>
   </div>
 
@@ -2445,12 +3393,13 @@ let ytInfo=null, ytJob=null, ytPoll=null, ytBusy=false;
 let qrLogo=null, qrKind='url', qrResult=null, qrSeq=0, qrTimer=null;
 let imgState={token:null,name:'',w:0,h:0,crop:null,ar:null,rotate:0,flip:false,
               url:'',b64:null};
-const PDF_TABS=['merge','split','compress','convert'];
+const PDF_TABS=['merge','split','compress','convert','pdf2md'];
 const VIDEO_TABS=['youtube','reels'];
 const GROUP_OF={merge:'pdf',split:'pdf',compress:'pdf',convert:'pdf',
-  youtube:'media',reels:'media',image:'media',qr:'media'};
+  pdf2md:'pdf',youtube:'media',reels:'media',image:'media',qr:'media'};
 const GO_LABEL={merge:'Merge & Download',split:'Split & Download',
   compress:'Compress & Download',convert:'Convert & Download',
+  pdf2md:'Convert to Markdown',
   youtube:'Download Video',reels:'Download Reel',image:'Export Image',
   qr:'Download QR Code'};
 const lastTab={pdf:'merge',media:'youtube'};
@@ -2565,6 +3514,7 @@ function render(){
   if(VIDEO_TABS.includes(tab))   $('go').disabled = !ytInfo||ytBusy;
   else if(tab==='qr')            $('go').disabled = !qrResult;
   else if(tab==='image')         $('go').disabled = !imgState.token;
+  else if(tab==='pdf2md')        $('go').disabled = !files.some(f=>f.kind==='pdf');
   else                           $('go').disabled = !has;
   if(tab==='split') refreshSplitVisibility();
   updateReadout();
@@ -2655,7 +3605,11 @@ document.body.addEventListener('drop',e=>{
   if(e.dataTransfer.files.length)addFiles(e.dataTransfer.files);});
 
 /* ---------- tabs ---------- */
-function updateAccept(){ $('file').accept=ACCEPT[currentRoute()]||''; }
+function updateAccept(){
+  // The element is #file; this tab only takes PDFs.
+  $('file').accept = (tab==='pdf2md') ? '.pdf,application/pdf'
+                                      : (ACCEPT[currentRoute()]||'');
+}
 function selectTab(name){
   tab=name; const g=GROUP_OF[name]; lastTab[g]=name;
   document.querySelectorAll('.tab').forEach(t=>
@@ -2664,6 +3618,7 @@ function selectTab(name){
     x.classList.toggle('active',x.dataset.g===g));
   ['merge','convert'].forEach(t=>$('opt-'+t)&&$('opt-'+t).classList.toggle('hide',t!==name));
   $('compressUI').classList.toggle('hide',name!=='compress');
+  $('mdUI').classList.toggle('hide',name!=='pdf2md');
   $('ytUI').classList.toggle('hide',!VIDEO_TABS.includes(name));
   $('imgUI').classList.toggle('hide',name!=='image');
   $('qrUI').classList.toggle('hide',name!=='qr');
@@ -2935,6 +3890,19 @@ function payload(full){
     else body.mode='each';
     return {ep:'/split', body};
   }
+  if(tab==='pdf2md'){
+    const pdfs=files.filter(f=>f.kind==='pdf');
+    let pf=null, pt=null;
+    const m=/^\s*(\d+)\s*[-:]\s*(\d+)\s*$/.exec($('mdPages').value.trim());
+    if(m){ pf=+m[1]; pt=+m[2]; }
+    else if(/^\s*\d+\s*$/.test($('mdPages').value)){ pf=pt=+$('mdPages').value; }
+    return {ep:'/pdf2md', body:{file:pdfs.length
+        ? refs[files.indexOf(pdfs[0])] : refs[0],
+      dpi:+$('mdDpi').value, images:$('mdImages').checked,
+      tables:$('mdTables').checked, math:$('mdMath').checked,
+      header:$('mdHeader').checked, index:$('mdIndex').checked,
+      page_from:pf, page_to:pt}};
+  }
   if(tab==='compress'){
     // If the preview already compressed everything, just download the cached bytes.
     if(!full && compPrev && compPrev.data && compPrev.sig===compSig()){
@@ -3062,7 +4030,7 @@ $('go').onclick=async()=>{
   try{
     let res=await send(false);
     if(res.status===409){          // cache expired (server restarted) — resend bytes
-      if(tab==='image'){ await imgReload(); res=await send(false); }
+  if(tab==='image'){ await imgReload(); res=await send(false); }
       else{
         files.forEach(f=>f.token=null); compPrev=null;
         files.filter(f=>f.kind==='pdf').forEach(inspectCover);
@@ -3467,6 +4435,16 @@ function updateReadout(){
       ['output',qrResult.size+' px'],
       ['payload',qrResult.chars+' ch']]);
   }
+  if(tab==='pdf2md'){
+    const pdfs=files.filter(f=>f.kind==='pdf');
+    if(!pdfs.length) return setReadout('idle',[['pdf \u2192 md','add a pdf']]);
+    const pg=pdfs.reduce((a,f)=>a+(f.pages||0),0);
+    const cells=[['queued',pdfs.length]];
+    if(pg) cells.push(['pages',pg]);
+    cells.push(['figures',$('mdImages').checked?'cropped':'off'],
+               ['header',$('mdHeader').checked?'on':'off']);
+    return setReadout('live',cells);
+  }
   if(tab==='image'){
     if(!imgState.token) return setReadout('idle',[['image','nothing loaded']]);
     const c=imgState.crop||{w:imgState.w,h:imgState.h};
@@ -3521,7 +4499,7 @@ def main():
           else "no (video capped ~720p, no vertical reframing)")
     print("=" * 60)
     print("  Multi Toolkit — running locally")
-    print("  PDF: merge · split · compress · convert")
+    print("  PDF: merge · split · compress · convert · pdf→md")
     print("  Media: youtube · reels · image · qr code")
     print(f"  Open:          {url}")
     print(f"  LibreOffice:   {lo}")
@@ -3538,4 +4516,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] in ("md", "pdf2md"):
+        md_cli(sys.argv[2:])          # headless batch conversion
+    else:
+        main()                        # normal: serve the UI

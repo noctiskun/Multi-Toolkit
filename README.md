@@ -10,7 +10,7 @@ python multi_toolkit.py
 
 That's the whole installation. Your browser opens automatically.
 
-> **[Try the QR generator in your browser →](https://noctiskun.github.io/Multi-Toolkit/)**
+> **[Try the QR generator in your browser →](https://<your-username>.github.io/multi-toolkit/)**
 > QR encoding needs no server, so that one feature runs live on the project page. Everything else needs the local app — see [Why the live page can't run everything](#why-the-live-page-cant-run-everything).
 
 ---
@@ -20,6 +20,7 @@ That's the whole installation. Your browser opens automatically.
 - [Features](#features)
 - [Quick start](#quick-start)
 - [Optional extras](#optional-extras)
+- [PDF → Markdown, for LLMs](#pdf--markdown-for-llms)
 - [QR codes with a centre logo](#qr-codes-with-a-centre-logo)
 - [Vertical video for Reels and Shorts](#vertical-video-for-reels-and-shorts)
 - [Why the live page can't run everything](#why-the-live-page-cant-run-everything)
@@ -89,6 +90,113 @@ Restart the app after installing any of them so it re-detects.
 Why ffmpeg matters for video: YouTube serves anything above 720p as *separate* video and audio streams. Without ffmpeg to merge them you are capped at whatever single combined stream exists, which is usually 720p.
 
 ---
+
+## PDF → Markdown, for LLMs
+
+Pasting a research paper into an LLM is expensive and lossy: the PDF is mostly
+font tables and compression, and if you screenshot it you lose the text. This
+converts it the other way round — **text stays text**, and only the figures
+become images.
+
+```bash
+# one paper
+python multi_toolkit.py md paper.pdf ./out
+
+# a folder of them, with an audit index
+python multi_toolkit.py md ~/papers ./out --index
+
+# just the parts you need
+python multi_toolkit.py md paper.pdf ./out --pages 3-12 --dpi 240
+```
+
+Or use the **PDF → MD** tab, which does the same thing and hands you a zip.
+
+### What comes out
+
+```
+out/attention-is-all-you-need/
+  attention-is-all-you-need.md          <- paste this
+  attention-is-all-you-need_p003_fig01.png
+  attention-is-all-you-need_p006_fig02.png
+```
+
+The `.md` opens with a short header explaining its own layout, so **you do not
+need to write a covering instruction** when you hand it to a model:
+
+```markdown
+> **How to read this file.** It was converted from a PDF (`paper.pdf`).
+> Text is real extracted text. Images are cropped from the page and appear at
+> the point in the reading order where they occur, so the figure above a
+> caption is the figure that caption describes. `<!-- page N -->` marks where
+> each PDF page begins.
+> **Lower confidence on page(s) 7** — little or no extractable text there, so
+> trust the image over the text.
+```
+
+### Figures are cropped, not screenshotted
+
+Each figure is cut to its own bounding box and placed at the point in the
+reading order where it occurs, immediately above its own caption:
+
+```markdown
+![Figure 3](paper_p006_fig03.png)
+
+*Figure 3: Attention weights across heads, layer 4.*
+```
+
+Captions are matched by proximity and searched both above and below the block,
+because figures caption below and tables caption above. A figure in the right
+column is emitted while reading the right column — not dropped into the middle
+of a left-column paragraph.
+
+### What survives
+
+| | |
+|---|---|
+| **Reading order** | Column-aware. Gutters are found by projecting text onto the x-axis, so one, two and three-column layouts all read correctly. Titles and full-width figures act as barriers rather than confusing the sweep. |
+| **Headings** | `#` levels from font size, weight and numbering (`3.1 Method`). |
+| **Tables** | Real Markdown tables, rebuilt from ruling geometry plus text position — works for both full cell grids and booktabs-style rules. |
+| **Equations** | Fenced in `$$` when a line is mostly mathematical. |
+| **Footnotes** | Kept as blockquotes, with wrapped continuation lines joined. |
+| **Running heads** | Dropped — detected by repetition across pages, with a size guard so a title that matches the running head survives. |
+
+### When it is not sure, it says so
+
+A page with no usable text layer is exported whole, marked in the body, and
+listed in the header. That is the point: a mangled page you cannot see is worse
+than a page image you can.
+
+```markdown
+<!-- page 7: no text layer; full page image -->
+![Page 7 (scanned — no text layer)](paper_p007.png)
+```
+
+### Options
+
+| CLI | Tab | Effect |
+|---|---|---|
+| `--no-images` | Extract figures | Text only, no PNGs at all |
+| `--no-tables` | Tables as Markdown | Leave tables as loose text |
+| `--no-math` | Equations as LaTeX | No `$$` fencing |
+| `--no-header` | Explain-itself header | Omit the preamble |
+| `--index` | Also write _INDEX.md | Batch audit table — **off by default** |
+| `--pages 3-12` | Pages | Convert a range only |
+| `--dpi 240` | Figure quality | Raster detail for the crops |
+
+`_INDEX.md` is for *you* reviewing a batch — which papers converted, how many
+figures each has, and which pages need your own eyes. A single paper does not
+need it, because its own header already explains itself.
+
+### Known limits
+
+- **Heavily designed layouts** (magazines, posters, pull-quotes) will confuse the
+  column sweep. Ordinary papers, reports and theses are the target.
+- **RTL scripts are untested.** Arabic and Hebrew may come out in visual rather
+  than logical order.
+- **Equation detection is heuristic.** Inline maths inside a sentence stays
+  inline text; only display equations get fenced.
+- **Scanned PDFs are not OCR'd.** They are exported as page images and flagged —
+  run OCR first if you need the text.
 
 ## QR codes with a centre logo
 

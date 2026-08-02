@@ -14,6 +14,9 @@ Pillow>=10.0
 # QR code encoding
 qrcode>=7.4
 
+# PDF -> Markdown (layout analysis, figure cropping)
+PyMuPDF>=1.24
+
 # Conversions
 pdf2docx>=0.5
 python-pptx>=0.6

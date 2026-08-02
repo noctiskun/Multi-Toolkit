@@ -207,6 +207,52 @@ try:
                                     "route": "img2pdf"}, raw=True)
     check("img2pdf", st == 200 and data[:4] == b"%PDF", f"{len(data)}B")
 
+    print("\n== /pdf2md ==")
+    import base64 as _b64, subprocess as _sp, sys as _sys, os as _os
+    _here = _os.path.dirname(_os.path.abspath(__file__))
+    if not _os.path.exists("/tmp/paper.pdf"):
+        _sp.run([_sys.executable, _os.path.join(_here, "make_test_paper.py")],
+                check=True, capture_output=True)
+    paper = _b64.b64encode(open("/tmp/paper.pdf", "rb").read()).decode()
+
+    st, data, hdr = post("/pdf2md", {"file": {"name": "paper.pdf", "data": paper}},
+                         raw=True)
+    check("converts a pdf", st == 200, f"HTTP {st}: {str(data)[:80]}")
+    check("returns a zip of md + figures", data[:2] == b"PK", f"{len(data)}B")
+    if data[:2] == b"PK":
+        import zipfile as _zf
+        z = _zf.ZipFile(io.BytesIO(data))
+        names = z.namelist()
+        check("zip holds the markdown", any(n.endswith(".md") for n in names),
+              str(names))
+        check("zip holds cropped figures",
+              sum(1 for n in names if "_fig" in n) >= 2, str(names))
+        md = z.read([n for n in names if n.endswith(".md")][0]).decode()
+        check("figures anchored in the markdown", md.count("![") >= 2)
+        check("table came through", "| Round-robin |" in md)
+        check("header present by default", "How to read this file" in md)
+        check("no _INDEX.md unless asked",
+              not any(n.endswith("_INDEX.md") for n in names), str(names))
+
+    st, data, _ = post("/pdf2md", {"file": {"name": "paper.pdf", "data": paper},
+                                   "index": True}, raw=True)
+    if st == 200 and data[:2] == b"PK":
+        import zipfile as _zf2
+        names = _zf2.ZipFile(io.BytesIO(data)).namelist()
+        check("index written when asked",
+              any(n.endswith("_INDEX.md") for n in names), str(names))
+
+    st, data, _ = post("/pdf2md", {"file": {"name": "paper.pdf", "data": paper},
+                                   "images": False, "header": False}, raw=True)
+    check("text-only mode returns a bare .md",
+          st == 200 and data[:2] != b"PK", f"HTTP {st}, {len(data)}B")
+    if st == 200 and data[:2] != b"PK":
+        check("header suppressed", b"How to read this file" not in data)
+
+    st, j, _ = post("/pdf2md", {"file": {"name": "x.pdf",
+                                         "data": _b64.b64encode(b"nope").decode()}})
+    check("garbage pdf rejected", st == 400, f"HTTP {st}")
+
     print("\n== error handling ==")
     st, j, _ = post("/nope", {})
     check("unknown route 404", st == 404, f"HTTP {st}")

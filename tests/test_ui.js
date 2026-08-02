@@ -55,6 +55,12 @@ const win = dom.window;
 const doc = win.document;
 const $ = id => doc.getElementById(id);
 
+function goTab(name) {
+  doc.querySelector(`.tab[data-tab="${name}"]`)
+    .dispatchEvent(new win.Event('click', { bubbles: true }));
+}
+const goTab2 = goTab;
+
 function step(label, fn) {
   try { fn(); console.log(`  ok   ${label}`); }
   catch (e) { errors.push(`${label}: ${e.message}`); console.log(`  FAIL ${label} — ${e.message}`); }
@@ -77,6 +83,7 @@ setTimeout(() => {
   console.log('\n== tab switching ==');
   const expect = {
     merge: 'Merge', split: 'Split', compress: 'Compress', convert: 'Convert',
+    pdf2md: 'Convert to Markdown',
     youtube: 'Download Video', reels: 'Download Reel', image: 'Export Image',
     qr: 'Download QR Code',
   };
@@ -88,7 +95,8 @@ setTimeout(() => {
       if (!a || a.dataset.tab !== name) throw new Error('active=' + (a && a.dataset.tab));
       if (!$('go').textContent.includes(label)) throw new Error('label=' + $('go').textContent);
       // the right panel must be visible, the others hidden
-      const panels = { youtube: 'ytUI', reels: 'ytUI', image: 'imgUI', qr: 'qrUI' };
+      const panels = { youtube: 'ytUI', reels: 'ytUI', image: 'imgUI',
+                       qr: 'qrUI', pdf2md: 'mdUI' };
       if (panels[name] && $(panels[name]).classList.contains('hide'))
         throw new Error(panels[name] + ' hidden');
       if (name !== 'qr' && !$('qrUI').classList.contains('hide'))
@@ -105,7 +113,7 @@ setTimeout(() => {
       new win.Event('click', { bubbles: true }));
     const active = () => doc.querySelector('.tab.active').dataset.tab;
     click('.group[data-g="pdf"]');
-    if (active() !== 'convert') throw new Error('pdf group -> ' + active());
+    if (active() !== 'pdf2md') throw new Error('pdf group -> ' + active());
     click('.group[data-g="media"]');
     if (active() !== 'qr') throw new Error('media group -> ' + active());
     // pick a different tab, leave, come back — it should still be there
@@ -120,8 +128,13 @@ setTimeout(() => {
     const rows = [...doc.querySelectorAll('.tabs')];
     if (rows.some(r => r.classList.contains('hide')))
       throw new Error('a tab row is hidden');
-    if (doc.querySelectorAll('.tab').length !== 8)
-      throw new Error('expected 8 tabs, got ' + doc.querySelectorAll('.tab').length);
+    const tabs = [...doc.querySelectorAll('.tab')].map(t => t.dataset.tab);
+    const want = ['merge', 'split', 'compress', 'convert', 'pdf2md',
+                  'youtube', 'reels', 'image', 'qr'];
+    for (const w of want)
+      if (!tabs.includes(w)) throw new Error('missing tab: ' + w);
+    if (tabs.length !== want.length)
+      throw new Error('expected ' + want.length + ' tabs, got ' + tabs.length);
     doc.querySelector('.tab[data-tab="qr"]').dispatchEvent(
       new win.Event('click', { bubbles: true }));
     const activeGroup = doc.querySelector('.group.active');
@@ -178,6 +191,20 @@ setTimeout(() => {
     if ($('qrLogoPctVal').textContent !== '30%') throw new Error($('qrLogoPctVal').textContent);
   });
 
+  console.log('\n== pdf -> markdown tab ==');
+  step('lives with the document tools', () => {
+    goTab2('pdf2md');
+    if (doc.querySelector('.group.active').dataset.g !== 'pdf')
+      throw new Error('not in the pdf group');
+    if ($('mdUI').classList.contains('hide')) throw new Error('panel hidden');
+    if ($('drop').classList.contains('hide')) throw new Error('needs the file list');
+  });
+  step('offers the four fidelity options, all on by default', () => {
+    for (const id of ['mdImages', 'mdTables', 'mdMath', 'mdHeader'])
+      if (!$(id).checked) throw new Error(id + ' should default on');
+    if ($('mdIndex').checked) throw new Error('index should default OFF');
+  });
+
   console.log('\n== theme ==');
   step('starts on a resolved theme', () => {
     const t = doc.documentElement.getAttribute('data-theme');
@@ -223,9 +250,6 @@ setTimeout(() => {
   });
 
   console.log('\n== video panel ==');
-  const goTab = n => doc.querySelector(`.tab[data-tab="${n}"]`)
-    .dispatchEvent(new win.Event('click', { bubbles: true }));
-
   step('reels shows vertical, defaulted to blurred backdrop', () => {
     goTab('reels');
     if ($('ytVertWrap').classList.contains('hide')) throw new Error('vertical control hidden');
